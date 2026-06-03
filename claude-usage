@@ -1,0 +1,537 @@
+#!/usr/bin/env python3
+"""
+claude-usage — track your Claude subscription plan & rate-limit usage from the terminal.
+
+Read-only, zero-dependency (Python 3 standard library only). For each Claude Code
+profile (a CLAUDE_CONFIG_DIR) it:
+
+  1. reads the OAuth credential from the macOS Keychain (file fallback elsewhere),
+  2. calls  GET https://api.anthropic.com/api/oauth/usage  with the bearer token,
+  3. prints the plan (Pro / Max 5x / Max 20x) and rate-limit windows as % remaining.
+
+Design / safety:
+  * NEVER writes to the Keychain, NEVER refreshes or rotates tokens (that would
+    invalidate your Claude Code login), and NEVER prints the token.
+  * When the live API call fails (e.g. HTTP 429 rate limit), it falls back to the
+    last cached response so you keep a view instead of an error.
+  * All data stays local. The cache lives under $XDG_CACHE_HOME/claude-usage.
+
+Disclaimer: this talks to an UNDOCUMENTED endpoint that Claude's own apps use with
+your existing OAuth session. It is unofficial, not affiliated with Anthropic, and
+may break without notice if the API changes. Use `--raw` to inspect the payload.
+
+Usage:
+  claude-usage                 # all auto-discovered profiles
+  claude-usage default work    # only these profiles (label or path)
+  claude-usage --watch 60      # refresh every 60s (uses cache on failure)
+  claude-usage --raw           # print the raw API JSON
+  claude-usage --all           # also show empty / internal windows
+  claude-usage --billing       # open the billing page (balance isn't in the API)
+  claude-usage --selftest      # test pure functions (no Keychain / no network)
+"""
+
+import argparse
+import glob
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+BILLING_URL = "https://claude.ai/settings/billing"
+BETA_HEADER = "oauth-2025-04-20"
+KEYCHAIN_PREFIX = "Claude Code-credentials"
+
+# known rate-limit windows, in display order (extra_usage is handled separately)
+WINDOWS = [
+    ("five_hour", "5h window"),
+    ("seven_day", "7d window"),
+    ("seven_day_opus", "7d Opus"),
+    ("seven_day_sonnet", "7d Sonnet"),
+    ("seven_day_cowork", "7d Cowork"),
+    ("seven_day_omelette", "7d Design"),
+    ("seven_day_oauth_apps", "7d OAuth apps"),
+]
+
+# credential `rateLimitTier` -> human plan label
+TIER_LABELS = {
+    "default_claude_free": "Free",
+    "default_claude_ai": "Pro",
+    "default_claude_max_5x": "Max 5x",
+    "default_claude_max_20x": "Max 20x",
+}
+
+# ---- colors (collapse to empty when not a TTY) -----------------------------
+def _c(code):
+    return code if sys.stdout.isatty() else ""
+
+BOLD, DIM, RED, GRN, YEL, CYN, RST = (
+    _c("\033[1m"), _c("\033[2m"), _c("\033[31m"),
+    _c("\033[32m"), _c("\033[33m"), _c("\033[36m"), _c("\033[0m"),
+)
+
+
+# ---- profile discovery (no hardcoded paths) --------------------------------
+def label_for(config_dir):
+    base = os.path.basename(config_dir.rstrip("/"))
+    if base == ".claude":
+        return "default"
+    if base.startswith(".claude-"):
+        return base[len(".claude-"):]
+    return base.lstrip(".") or base
+
+
+def discover_profiles():
+    """Ordered list of (label, config_dir) found on this machine."""
+    found = {}  # config_dir -> label, preserves insertion order
+
+    def add(cdir):
+        if not cdir:
+            return
+        cdir = os.path.abspath(os.path.expanduser(cdir))
+        if os.path.isdir(cdir) and cdir not in found:
+            found[cdir] = label_for(cdir)
+
+    add(os.environ.get("CLAUDE_CONFIG_DIR"))
+    add(os.path.join(HOME, ".claude"))
+    for p in sorted(glob.glob(os.path.join(HOME, ".claude-*"))):
+        add(p)
+    return [(label, cdir) for cdir, label in found.items()]
+
+
+# ---- credential resolution -------------------------------------------------
+def candidate_services(config_dir):
+    """Keychain service names to try, in order, for a CLAUDE_CONFIG_DIR.
+
+    Claude Code stores per-config-dir credentials under
+    `Claude Code-credentials-<first 8 hex of sha256(path)>`. The exact input is
+    not documented, so we try a few normalizations and use whichever exists.
+    """
+    inputs = []
+    for s in (config_dir, config_dir.rstrip("/"), config_dir + "/", os.path.realpath(config_dir)):
+        if s not in inputs:
+            inputs.append(s)
+    names = []
+    for s in inputs:
+        h = hashlib.sha256(s.encode()).hexdigest()[:8]
+        name = "%s-%s" % (KEYCHAIN_PREFIX, h)
+        if name not in names:
+            names.append(name)
+    names.append(KEYCHAIN_PREFIX)  # default profile (no override)
+    return names
+
+
+def read_keychain(service):
+    """Return the secret blob (str) from the macOS Keychain, or None.
+
+    The first read of an item may show a GUI authorization prompt; click
+    "Always Allow" to avoid being asked again.
+    """
+    try:
+        out = subprocess.run(
+            ["security", "find-generic-password", "-s", service, "-w"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
+
+
+def parse_oauth(blob):
+    """Extract the OAuth dict from a JSON blob (with or without a wrapper)."""
+    try:
+        data = json.loads(blob)
+    except Exception:
+        return None
+    if isinstance(data, dict):
+        if isinstance(data.get("claudeAiOauth"), dict):
+            return data["claudeAiOauth"]
+        if "accessToken" in data or "access_token" in data:
+            return data
+    return None
+
+
+def load_credentials(config_dir):
+    """Return (oauth_dict, source_str) or (None, reason_str)."""
+    # 1) credentials file (fallback / non-macOS platforms)
+    fpath = os.path.join(config_dir, ".credentials.json")
+    if os.path.isfile(fpath):
+        try:
+            with open(fpath) as fh:
+                oauth = parse_oauth(fh.read())
+            if oauth:
+                return oauth, "file %s" % fpath
+        except Exception:
+            pass
+    # 2) macOS Keychain (candidate service names)
+    for service in candidate_services(config_dir):
+        blob = read_keychain(service)
+        if not blob:
+            continue
+        oauth = parse_oauth(blob)
+        if oauth:
+            return oauth, "keychain «%s»" % service
+    return None, "credential not found (Keychain / file)"
+
+
+# ---- usage API -------------------------------------------------------------
+def fetch_usage(access_token):
+    """Return (status_int, json_or_text). No external dependencies."""
+    import urllib.request
+    import urllib.error
+
+    req = urllib.request.Request(USAGE_URL, method="GET")
+    req.add_header("Authorization", "Bearer %s" % access_token)
+    req.add_header("anthropic-beta", BETA_HEADER)
+    req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", "claude-usage-cli")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read().decode()
+            try:
+                return resp.status, json.loads(body)
+            except Exception:
+                return resp.status, body
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        try:
+            return e.code, json.loads(body)
+        except Exception:
+            return e.code, body
+    except Exception as e:
+        return 0, "network error: %s" % e
+
+
+def failure_reason(status, data):
+    if status == 0:
+        return str(data)
+    if status == 401:
+        return "token expired/invalid (401) — use Claude in this profile once to refresh"
+    if status == 429:
+        return "rate limited (429)"
+    msg = ""
+    if isinstance(data, dict) and isinstance(data.get("error"), dict):
+        msg = data["error"].get("message", "")
+    return "HTTP %s%s" % (status, (": " + msg) if msg else "")
+
+
+# ---- local cache (so 429 / outages still show something) -------------------
+def cache_dir():
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache")
+    return os.path.join(base, "claude-usage")
+
+
+def cache_file(config_dir):
+    h = hashlib.sha256(os.path.abspath(config_dir).encode()).hexdigest()[:16]
+    return os.path.join(cache_dir(), h + ".json")
+
+
+def write_cache(config_dir, data):
+    try:
+        os.makedirs(cache_dir(), exist_ok=True)
+        tmp = cache_file(config_dir) + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump({"fetched_at": time.time(), "data": data}, fh)
+        os.replace(tmp, cache_file(config_dir))
+    except Exception:
+        pass  # cache is best-effort
+
+
+def read_cache(config_dir):
+    try:
+        with open(cache_file(config_dir)) as fh:
+            obj = json.load(fh)
+        return obj.get("data"), obj.get("fetched_at")
+    except Exception:
+        return None, None
+
+
+# ---- formatting ------------------------------------------------------------
+def humanize_reset(iso):
+    if not iso:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return iso
+    secs = int((dt - datetime.now(timezone.utc)).total_seconds())
+    if secs <= 0:
+        rel = "now"
+    elif secs < 3600:
+        rel = "in %dm" % (secs // 60)
+    elif secs < 86400:
+        rel = "in %dh%02dm" % (secs // 3600, (secs % 3600) // 60)
+    else:
+        rel = "in %dd%dh" % (secs // 86400, (secs % 86400) // 3600)
+    return "%s (%s)" % (dt.astimezone().strftime("%d/%m %H:%M"), rel)
+
+
+def humanize_age(ts):
+    if not ts:
+        return "unknown age"
+    secs = int(time.time() - ts)
+    if secs < 60:
+        return "%ds ago" % secs
+    if secs < 3600:
+        return "%dm ago" % (secs // 60)
+    if secs < 86400:
+        return "%dh%02dm ago" % (secs // 3600, (secs % 3600) // 60)
+    return "%dd ago" % (secs // 86400)
+
+
+def bar(remaining, width=20):
+    """Bar of what's LEFT: full/green = plenty remaining, empty/red = nearly out."""
+    r = max(0.0, min(100.0, float(remaining)))
+    fill = int(round(r / 100 * width))
+    color = GRN if r > 40 else (YEL if r > 10 else RED)
+    return "%s%s%s%s" % (color, "█" * fill, RST, "░" * (width - fill))
+
+
+def plan_label(oauth):
+    """Return (label, subscriptionType, rateLimitTier)."""
+    sub = str(oauth.get("subscriptionType") or oauth.get("subscription_type") or "?")
+    tier = str(oauth.get("rateLimitTier") or oauth.get("rate_limit_tier") or "?")
+    label = TIER_LABELS.get(tier)
+    if not label:
+        t = tier.lower()
+        if t.endswith("max_20x"):
+            label = "Max 20x"
+        elif t.endswith("max_5x"):
+            label = "Max 5x"
+        elif sub in ("pro", "free"):
+            label = sub.capitalize()
+        else:
+            label = sub
+    return label, sub, tier
+
+
+def fmt_window(win):
+    """Bar line showing the % that REMAINS, or None if there is no data."""
+    util = win.get("utilization")
+    if not isinstance(util, (int, float)):
+        return None
+    remaining = 100.0 - float(util)
+    resets = win.get("resets_at") or win.get("reset_at") or win.get("resetsAt")
+    return "%s %5.1f%% left  %s%s%s" % (bar(remaining), remaining, DIM, humanize_reset(resets), RST)
+
+
+def fmt_extra_usage(win):
+    """Format the on-demand overage block (NOT the prepaid billing balance)."""
+    if not win.get("is_enabled"):
+        return "%sdisabled%s" % (DIM, RST)
+    used = win.get("used_credits") or 0
+    limit = win.get("monthly_limit")
+    cur = (win.get("currency") or "").strip()
+    lim_s = ("%g" % limit) if isinstance(limit, (int, float)) else "∞"
+    return "enabled · %g/%s %s" % (float(used), lim_s, cur)
+
+
+# ---- rendering -------------------------------------------------------------
+def render_profile(label, config_dir, raw=False, show_all=False):
+    print("%s%s● %s%s  %s(%s)%s" % (BOLD, CYN, label, RST, DIM, config_dir, RST))
+    oauth, source = load_credentials(config_dir)
+    if not oauth:
+        print("   %s%s%s\n" % (RED, source, RST))
+        return
+    token = oauth.get("accessToken") or oauth.get("access_token")
+    if not token:
+        print("   %sno accessToken in credential%s\n" % (RED, RST))
+        return
+
+    label_plan, sub, tier = plan_label(oauth)
+    print("   plan:   %s%s%s  %s(%s · rateLimitTier=%s)%s" % (BOLD, label_plan, RST, DIM, sub, tier, RST))
+    print("   %ssource: %s%s" % (DIM, source, RST))
+
+    status, data = fetch_usage(token)
+    stale_age = None
+    if status == 200 and isinstance(data, dict):
+        write_cache(config_dir, data)
+    else:
+        reason = failure_reason(status, data)
+        cached, ts = read_cache(config_dir)
+        if cached is not None:
+            data, stale_age = cached, ts
+            print("   %s⚠ live fetch failed (%s) — showing cache%s" % (YEL, reason, RST))
+        else:
+            print("   %sAPI failure: %s (no cache yet)%s\n" % (RED, reason, RST))
+            return
+
+    if stale_age is not None:
+        print("   %s⏁ cached %s%s" % (YEL, humanize_age(stale_age), RST))
+
+    if raw:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        print()
+        return
+
+    W = 14
+    shown = set()
+    for key, rotulo in WINDOWS:
+        win = data.get(key)
+        if not isinstance(win, dict):
+            continue
+        line = fmt_window(win)
+        if line is None:
+            if not show_all:
+                continue
+            line = "%s—%s" % (DIM, RST)
+        shown.add(key)
+        print("   %-*s %s" % (W, rotulo, line))
+
+    eu = data.get("extra_usage")
+    if isinstance(eu, dict):
+        shown.add("extra_usage")
+        print("   %-*s %s" % (W, "overage", fmt_extra_usage(eu)))
+
+    for key in data:
+        if key in shown:
+            continue
+        win = data.get(key)
+        if isinstance(win, dict):
+            line = fmt_window(win)
+            if line is not None:
+                shown.add(key)
+                print("   %-*s %s" % (W, key, line))
+
+    if show_all:
+        rest = [k for k in data if k not in shown]
+        if rest:
+            print("   %s+ no data: %s%s" % (DIM, ", ".join(rest), RST))
+    print()
+
+
+def open_url(url):
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["open", url])
+        elif sys.platform.startswith("win"):
+            os.startfile(url)  # noqa
+        else:
+            subprocess.run(["xdg-open", url])
+        return True
+    except Exception:
+        return False
+
+
+# ---- selftest (no Keychain / no network / no personal data) ----------------
+def selftest():
+    import re
+    ok = True
+
+    def check(name, cond):
+        nonlocal ok
+        ok = ok and bool(cond)
+        print("  [%s] %s" % ("OK" if cond else "FAIL", name))
+
+    cands = candidate_services("/tmp/example-config")
+    check("service name = prefix + 8 hex",
+          any(re.match(r"^Claude Code-credentials-[0-9a-f]{8}$", c) for c in cands))
+    check("default (plain) service present", KEYCHAIN_PREFIX in cands)
+
+    check("plan Max 20x", plan_label({"rateLimitTier": "default_claude_max_20x"})[0] == "Max 20x")
+    check("plan Max 5x", plan_label({"rateLimitTier": "default_claude_max_5x"})[0] == "Max 5x")
+    check("plan Pro", plan_label({"subscriptionType": "pro", "rateLimitTier": "default_claude_ai"})[0] == "Pro")
+    check("plan unknown tier falls back to sub", plan_label({"subscriptionType": "team"})[0] == "team")
+
+    check("parse_oauth wrapper", (parse_oauth('{"claudeAiOauth":{"accessToken":"x"}}') or {}).get("accessToken") == "x")
+    check("parse_oauth flat", (parse_oauth('{"access_token":"y"}') or {}).get("access_token") == "y")
+    check("parse_oauth junk -> None", parse_oauth("not json") is None)
+
+    check("fmt_window null -> None", fmt_window({"utilization": None}) is None)
+    check("fmt_window numeric -> str", isinstance(fmt_window({"utilization": 42.0, "resets_at": "2030-01-01T00:00:00Z"}), str))
+    check("fmt_extra_usage disabled", "disabled" in fmt_extra_usage({"is_enabled": False}))
+    check("fmt_extra_usage enabled",
+          "enabled" in fmt_extra_usage({"is_enabled": True, "used_credits": 0.0, "monthly_limit": 100, "currency": "USD"}))
+
+    check("failure_reason 429", "429" in failure_reason(429, {}))
+    check("failure_reason 401", "401" in failure_reason(401, {}))
+    check("humanize_age str", isinstance(humanize_age(time.time() - 120), str))
+
+    print("\n%s" % ("ALL OK" if ok else "FAILED"))
+    return 0 if ok else 1
+
+
+# ---- main ------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(
+        prog="claude-usage",
+        description="Track Claude subscription plan & rate-limit usage per profile.",
+    )
+    ap.add_argument("profiles", nargs="*",
+                    help="profile labels or config-dir paths (default: all auto-discovered)")
+    ap.add_argument("--watch", type=int, metavar="SECS",
+                    help="refresh every N seconds (cache covers transient failures; 60+ recommended)")
+    ap.add_argument("--raw", action="store_true", help="print the raw API JSON")
+    ap.add_argument("--all", action="store_true", dest="show_all",
+                    help="also show empty / internal windows")
+    ap.add_argument("--billing", action="store_true",
+                    help="open the billing page in a browser (the balance is not in the API)")
+    ap.add_argument("--selftest", action="store_true",
+                    help="test pure functions (no Keychain / no network)")
+    args = ap.parse_args()
+
+    if args.selftest:
+        return selftest()
+
+    if args.billing:
+        print("opening %s ...\n(the balance is per browser-logged-in account; switch accounts there if needed)" % BILLING_URL)
+        if not open_url(BILLING_URL):
+            print("could not open a browser. Visit manually: %s" % BILLING_URL)
+        return 0
+
+    discovered = discover_profiles()
+    by_label = {}
+    for lbl, d in discovered:
+        by_label.setdefault(lbl, d)
+
+    if args.profiles:
+        chosen = []
+        for p in args.profiles:
+            if p in by_label:
+                chosen.append((p, by_label[p]))
+            elif os.path.isdir(os.path.expanduser(p)):
+                d = os.path.abspath(os.path.expanduser(p))
+                chosen.append((label_for(d), d))
+            else:
+                print("unknown profile: %s (known: %s)" % (p, ", ".join(by_label) or "none"))
+                return 2
+    else:
+        chosen = discovered
+
+    if not chosen:
+        print("no Claude profiles found (looked at $CLAUDE_CONFIG_DIR, ~/.claude, ~/.claude-*)")
+        return 1
+
+    def run_once():
+        stamp = datetime.now().strftime("%d/%m %H:%M:%S")
+        print("%sclaude-usage%s  %s%s%s\n" % (BOLD, RST, DIM, stamp, RST))
+        for label, cdir in chosen:
+            render_profile(label, cdir, raw=args.raw, show_all=args.show_all)
+
+    if args.watch:
+        try:
+            while True:
+                if sys.stdout.isatty():
+                    sys.stdout.write("\033[2J\033[H")
+                run_once()
+                print("%s↻ every %ss — Ctrl-C to quit%s" % (DIM, args.watch, RST))
+                time.sleep(args.watch)
+        except KeyboardInterrupt:
+            print("\nbye.")
+            return 0
+    else:
+        run_once()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
