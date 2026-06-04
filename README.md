@@ -44,7 +44,8 @@ endpoint. `claude-usage` surfaces both, for every profile you have, in one comma
 
 1. **Find profiles.** A "profile" is a `CLAUDE_CONFIG_DIR`. The tool auto-discovers
    `$CLAUDE_CONFIG_DIR`, `~/.claude`, and any `~/.claude-*` directory. You can also
-   pass labels or paths explicitly.
+   pass labels or paths explicitly. (When you have named `~/.claude-*` profiles, the
+   bare `~/.claude` is hidden by default — see [Profiles & accounts](#profiles--accounts).)
 2. **Read the credential.** On macOS it reads the Keychain item
    `Claude Code-credentials` (or the per-profile hashed variant
    `Claude Code-credentials-<first 8 hex of sha256(config_dir)>`). On other
@@ -64,6 +65,25 @@ endpoint. `claude-usage` surfaces both, for every profile you have, in one comma
 | `default_claude_max_5x`   | Max 5x   |
 | `default_claude_max_20x`  | Max 20x  |
 
+## Profiles & accounts
+
+If you run more than one Claude login on a machine, several config dirs can point
+at the **same account** — most commonly the bare `~/.claude` (default) and a named
+`~/.claude-<name>` you created on purpose. `claude-usage` keeps the view tidy:
+
+- **The bare `~/.claude` is hidden by default** when any named `~/.claude-*` profile
+  exists — you made the named path because that's the one you want. Show it with
+  `--include-default`, or query it directly with `claude-usage default`.
+- **Same-account de-duplication.** The access tokens are opaque and the credential
+  holds no account id, so two profiles can't be proven to share an account *before*
+  calling. Instead, each account is fingerprinted from its usage **reset timestamps**
+  (microsecond precision → effectively unique). Once two profiles are seen returning
+  the same fingerprint, they collapse into one line under the named (path) label, and
+  the fingerprint is remembered under `~/.cache/claude-usage` for next time.
+- **No wrong merges, no lost data.** Until a shared account is confirmed by a matching
+  fingerprint, profiles are shown separately rather than guessed-merged — so the tool
+  never prints one account's numbers under another's label.
+
 ## Install
 
 Requires Python 3.8+ (standard library only). macOS for the Keychain path; Linux/
@@ -79,8 +99,9 @@ ln -s "$PWD/claude-usage" ~/.local/bin/claude-usage
 ## Usage
 
 ```sh
-claude-usage                 # all auto-discovered profiles
+claude-usage                 # auto-discovered profiles (bare ~/.claude hidden if named ones exist)
 claude-usage personal work   # only these (label or path)
+claude-usage --include-default  # also show the bare ~/.claude profile
 claude-usage --watch 60      # refresh every 60s
 claude-usage --raw           # raw API JSON (useful when the schema changes)
 claude-usage --all           # also show empty / internal windows
@@ -88,13 +109,15 @@ claude-usage --billing       # open the billing page in a browser
 claude-usage --selftest      # test pure functions (no Keychain / no network)
 ```
 
-| Flag         | What it does |
-|--------------|--------------|
-| `--watch N`  | Re-render every `N` seconds. Cache covers transient failures; use 60s+. |
-| `--raw`      | Dump the unparsed usage JSON. |
-| `--all`      | Show windows with no data and internal codename fields. |
-| `--billing`  | Open the billing page (the prepaid balance is **not** in the API). |
-| `--selftest` | Run the offline unit checks. |
+| Flag                | What it does |
+|---------------------|--------------|
+| `--include-default` | Also show the bare `~/.claude` profile (hidden by default when named profiles exist). |
+| `--watch N`         | Re-render every `N` seconds. Cache covers transient failures; use 60s+. |
+| `--raw`             | Dump the unparsed usage JSON. |
+| `--all`             | Show windows with no data and internal codename fields. |
+| `--billing`         | Open the billing page (the prepaid balance is **not** in the API). |
+| `--debug-accounts`  | Diagnose how profiles map to accounts (prints only field names + short hashes, never secrets). |
+| `--selftest`        | Run the offline unit checks. |
 
 ## Caching (survives rate limits)
 

@@ -282,6 +282,52 @@ def read_cache(config_dir):
         return None, None
 
 
+def fingerprint(data):
+    """Account-stable fingerprint built from the windows' reset timestamps
+    (microsecond precision → effectively unique per account). Lets us recognize
+    two profiles that point at the SAME account even with opaque tokens and no
+    account id in the credential. Returns None when there are no windows."""
+    if not isinstance(data, dict):
+        return None
+    stamps = []
+    for k in sorted(data.keys()):
+        v = data.get(k)
+        if isinstance(v, dict):
+            r = v.get("resets_at") or v.get("reset_at") or v.get("resetsAt")
+            if r:
+                stamps.append("%s=%s" % (k, r))
+    if not stamps:
+        return None
+    return hashlib.sha256("|".join(stamps).encode()).hexdigest()[:16]
+
+
+def _fp_store_path():
+    return os.path.join(cache_dir(), "accounts.json")
+
+
+def load_fp_store():
+    try:
+        with open(_fp_store_path()) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def save_fp(config_dir, fp):
+    """Remember which account fingerprint a config dir last produced, so the same
+    account can be recognized later even if its token is temporarily rate-limited."""
+    try:
+        os.makedirs(cache_dir(), exist_ok=True)
+        store = load_fp_store()
+        store[os.path.abspath(config_dir)] = fp
+        tmp = _fp_store_path() + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(store, fh)
+        os.replace(tmp, _fp_store_path())
+    except Exception:
+        pass
+
+
 # ---- formatting ------------------------------------------------------------
 def humanize_reset(iso):
     if not iso:
@@ -401,65 +447,87 @@ def render_windows(data, show_all=False):
             print("   %s+ no data: %s%s" % (DIM, ", ".join(rest), RST))
 
 
-def render_profile(label, config_dir, seen, raw=False, show_all=False):
-    print("%s%s● %s%s  %s(%s)%s" % (BOLD, CYN, label, RST, DIM, config_dir, RST))
+def gather(label, config_dir):
+    """Fetch one profile's usage (live, falling back to cache) and tag it with the
+    account fingerprint. Returns a result dict consumed by the grouping step."""
+    res = {"label": label, "config_dir": config_dir, "oauth": None,
+           "source": None, "data": None, "stale_age": None, "reason": None, "fp": None}
     oauth, source = load_credentials(config_dir)
+    res["source"] = source
     if not oauth:
-        print("   %s%s%s\n" % (RED, source, RST))
-        return
+        res["reason"] = source
+        return res
+    res["oauth"] = oauth
     token = oauth.get("accessToken") or oauth.get("access_token")
     if not token:
-        print("   %sno accessToken in credential%s\n" % (RED, RST))
-        return
-
-    label_plan, sub, tier = plan_label(oauth)
-    print("   plan:   %s%s%s  %s(%s · rateLimitTier=%s)%s" % (BOLD, label_plan, RST, DIM, sub, tier, RST))
-    print("   %ssource: %s%s" % (DIM, source, RST))
-
-    # Same account already fetched this run? Reuse it — never call the API twice
-    # for one account (that is what was triggering the 429).
-    aid = account_id(oauth)
-    if aid is not None and aid in seen:
-        prev_label, prev_data = seen[aid]
-        print("   %s↳ same account as «%s» — reused (no extra API call)%s" % (DIM, prev_label, RST))
-        if prev_data is None:
-            print("   %s(no data from that fetch)%s\n" % (DIM, RST))
-            return
-        if raw:
-            print(json.dumps(prev_data, indent=2, ensure_ascii=False))
-        else:
-            render_windows(prev_data, show_all)
-        print()
-        return
+        res["reason"] = "no accessToken in credential"
+        return res
 
     status, data = fetch_usage(token)
-    stale_age = None
     if status == 200 and isinstance(data, dict):
         write_cache(config_dir, data)
+        res["data"] = data
     else:
-        reason = failure_reason(status, data)
+        res["reason"] = failure_reason(status, data)
         cached, ts = read_cache(config_dir)
         if cached is not None:
-            data, stale_age = cached, ts
-            print("   %s⚠ live fetch failed (%s) — showing cache%s" % (YEL, reason, RST))
-        else:
-            print("   %sAPI failure: %s (no cache yet)%s\n" % (RED, reason, RST))
-            if aid is not None:
-                seen[aid] = (label, None)  # mark attempted so duplicates don't re-call
-            return
+            res["data"], res["stale_age"] = cached, ts
 
-    if aid is not None:
-        seen.setdefault(aid, (label, data))
+    fp = fingerprint(res["data"])
+    if fp:
+        res["fp"] = fp
+        save_fp(config_dir, fp)          # learn this account's fingerprint
+    else:
+        res["fp"] = load_fp_store().get(os.path.abspath(config_dir))  # last known
+    return res
 
-    if stale_age is not None:
-        print("   %s⏁ cached %s%s" % (YEL, humanize_age(stale_age), RST))
+
+def group_key(res):
+    """Key that groups profiles belonging to the same account. Prefer the usage
+    fingerprint (matches across different tokens of one account); fall back to the
+    token hash (matches byte-identical/copied logins); else the dir (stays unique)."""
+    if res.get("fp"):
+        return "fp:" + res["fp"]
+    oauth = res.get("oauth") or {}
+    tok = oauth.get("accessToken") or oauth.get("access_token")
+    if tok:
+        return "tok:" + hashlib.sha256(tok.encode()).hexdigest()[:16]
+    return "cfg:" + os.path.abspath(res["config_dir"])
+
+
+def render_group(members, raw=False, show_all=False):
+    """Render one account. members[0] is the highest-priority profile (named path
+    beats the bare default); data comes from whichever member actually has it."""
+    top = members[0]
+    data_member = next((m for m in members if m.get("data") is not None), None)
+    oauth = top.get("oauth") or (data_member.get("oauth") if data_member else None)
+
+    print("%s%s● %s%s  %s(%s)%s" % (BOLD, CYN, top["label"], RST, DIM, top["config_dir"], RST))
+    if oauth is None:
+        print("   %s%s%s\n" % (RED, top.get("reason") or "credential not found", RST))
+        return
+    plan, sub, tier = plan_label(oauth)
+    print("   plan:   %s%s%s  %s(%s · rateLimitTier=%s)%s" % (BOLD, plan, RST, DIM, sub, tier, RST))
+    print("   %ssource: %s%s" % (DIM, top.get("source"), RST))
+
+    if len(members) > 1:
+        others = ", ".join(m["label"] for m in members[1:])
+        print("   %s↳ same account as: %s (collapsed)%s" % (DIM, others, RST))
+
+    if data_member is None:
+        print("   %sAPI failure: %s (no cache yet)%s\n" % (RED, top.get("reason") or "no data", RST))
+        return
+    if data_member is not top:
+        print("   %s↳ data via «%s» — «%s» token unavailable (%s)%s" % (
+            YEL, data_member["label"], top["label"], top.get("reason"), RST))
+    if data_member.get("stale_age") is not None:
+        print("   %s⏁ cached %s%s" % (YEL, humanize_age(data_member["stale_age"]), RST))
 
     if raw:
-        print(json.dumps(data, indent=2, ensure_ascii=False))
+        print(json.dumps(data_member["data"], indent=2, ensure_ascii=False))
         print()
         return
-
-    render_windows(data, show_all)
+    render_windows(data_member["data"], show_all)
     print()
 
 
@@ -474,6 +542,47 @@ def open_url(url):
         return True
     except Exception:
         return False
+
+
+def debug_accounts(chosen):
+    """Print how each profile maps to an account, WITHOUT exposing any secret:
+    only field/claim names and short sha256 hashes of their values. Used to find
+    which field uniquely identifies an account so duplicates can be de-duplicated.
+    """
+    def sha8(v):
+        return hashlib.sha256(str(v).encode()).hexdigest()[:8]
+
+    print("debug-accounts (names + hashed values only; no tokens, no raw values)\n")
+    for label, cdir in chosen:
+        print("● %s  (%s)" % (label, cdir))
+        oauth, source = load_credentials(cdir)
+        if not oauth:
+            print("   %s\n" % source)
+            continue
+        print("   source: %s" % source)
+        print("   cred keys: %s" % ", ".join(sorted(oauth.keys())))
+        for k in sorted(oauth.keys()):
+            if k in ("accessToken", "access_token", "refreshToken", "refresh_token", "scopes", "expiresAt"):
+                continue
+            print("     %-18s = #%s" % (k, sha8(oauth[k])))
+        tok = oauth.get("accessToken") or oauth.get("access_token") or ""
+        parts = tok.split(".")
+        print("   token: %d parts (%s)" % (len(parts), "JWT-shaped" if len(parts) >= 3 else "opaque"))
+        if len(parts) >= 2:
+            try:
+                seg = parts[1] + "=" * (-len(parts[1]) % 4)
+                claims = json.loads(base64.urlsafe_b64decode(seg).decode("utf-8", "replace"))
+                print("   claim keys: %s" % ", ".join(sorted(claims.keys())))
+                for k in sorted(claims.keys()):
+                    if k in ("exp", "iat", "nbf", "jti"):  # volatile per-token; skip
+                        continue
+                    print("     %-18s = #%s" % (k, sha8(claims[k])))
+            except Exception as e:
+                print("   (claim decode failed: %s)" % e)
+        print("   account_id() -> #%s" % sha8(account_id(oauth)))
+        print()
+    print("Compare the hashes: a field whose #value is the SAME for two profiles")
+    print("but DIFFERENT for the others identifies the shared account.")
 
 
 # ---- selftest (no Keychain / no network / no personal data) ----------------
@@ -510,10 +619,15 @@ def selftest():
     check("failure_reason 401", "401" in failure_reason(401, {}))
     check("humanize_age str", isinstance(humanize_age(time.time() - 120), str))
 
-    seg = base64.urlsafe_b64encode(json.dumps({"sub": "acc_X"}).encode()).decode().rstrip("=")
-    check("account_id from JWT sub", account_id({"accessToken": "h." + seg + ".s"}) == "id:acc_X")
-    check("account_id dedups same token", account_id({"accessToken": "z"}) == account_id({"access_token": "z"}))
-    check("account_id differs by token", account_id({"accessToken": "a"}) != account_id({"accessToken": "b"}))
+    fp1 = fingerprint({"five_hour": {"resets_at": "2030-01-01T00:00:00.111+00:00"}})
+    fp3 = fingerprint({"five_hour": {"resets_at": "2030-01-01T00:00:00.222+00:00"}})
+    check("fingerprint stable", bool(fp1) and fp1 == fingerprint({"five_hour": {"resets_at": "2030-01-01T00:00:00.111+00:00"}}))
+    check("fingerprint differs by reset", fp1 != fp3)
+    check("fingerprint none without windows", fingerprint({"subscriptionType": "pro"}) is None)
+    check("group_key by fingerprint", group_key({"fp": "abc"}) == "fp:abc")
+    check("group_key by token when no fp", group_key({"oauth": {"accessToken": "t"}}).startswith("tok:"))
+    check("group_key distinct tokens differ",
+          group_key({"oauth": {"accessToken": "a"}}) != group_key({"oauth": {"accessToken": "b"}}))
 
     print("\n%s" % ("ALL OK" if ok else "FAILED"))
     return 0 if ok else 1
@@ -534,6 +648,10 @@ def main():
                     help="also show empty / internal windows")
     ap.add_argument("--billing", action="store_true",
                     help="open the billing page in a browser (the balance is not in the API)")
+    ap.add_argument("--debug-accounts", action="store_true", dest="debug_accounts",
+                    help="diagnose how profiles map to accounts (safe: field names + hashes only)")
+    ap.add_argument("--include-default", action="store_true", dest="include_default",
+                    help="also show the bare ~/.claude profile (hidden by default when named profiles exist)")
     ap.add_argument("--selftest", action="store_true",
                     help="test pure functions (no Keychain / no network)")
     args = ap.parse_args()
@@ -564,18 +682,40 @@ def main():
                 print("unknown profile: %s (known: %s)" % (p, ", ".join(by_label) or "none"))
                 return 2
     else:
-        chosen = discovered
+        chosen = list(discovered)
+        # The bare ~/.claude is usually the same login as one of the named
+        # ~/.claude-<name> dirs the user deliberately created. Hide it from the
+        # default view when named profiles exist (the named path wins), unless
+        # ~/.claude is the explicitly selected CLAUDE_CONFIG_DIR or --include-default.
+        default_abs = os.path.abspath(os.path.join(HOME, ".claude"))
+        env = os.environ.get("CLAUDE_CONFIG_DIR")
+        env_is_default = bool(env) and os.path.abspath(os.path.expanduser(env)) == default_abs
+        named_exist = any(d != default_abs for _, d in chosen)
+        if named_exist and not env_is_default and not args.include_default:
+            chosen = [(l, d) for (l, d) in chosen if d != default_abs]
 
     if not chosen:
         print("no Claude profiles found (looked at $CLAUDE_CONFIG_DIR, ~/.claude, ~/.claude-*)")
         return 1
 
+    if args.debug_accounts:
+        debug_accounts(chosen)
+        return 0
+
     def run_once():
         stamp = datetime.now().strftime("%d/%m %H:%M:%S")
         print("%sclaude-usage%s  %s%s%s\n" % (BOLD, RST, DIM, stamp, RST))
-        seen = {}  # account_id -> (label, data): fetch each account only once per run
-        for label, cdir in chosen:
-            render_profile(label, cdir, seen, raw=args.raw, show_all=args.show_all)
+        results = [gather(label, cdir) for (label, cdir) in chosen]  # priority order
+        groups, index = [], {}
+        for r in results:
+            k = group_key(r)
+            if k in index:
+                index[k].append(r)
+            else:
+                index[k] = [r]
+                groups.append(index[k])
+        for members in groups:
+            render_group(members, raw=args.raw, show_all=args.show_all)
 
     if args.watch:
         try:
