@@ -129,5 +129,5 @@ inspect the current payload and open an issue/PR if the schema drifts.
 
 ## License
 
-[The Unlicense](LICENSE) — public domain. Do whatever you want with it: use, copy,
-modify, sell, redistribute. No attribution required, no restrictions.
+[MIT](LICENSE) — free for any use, including commercial. You may copy, modify, and
+redistribute it; just keep the copyright and license notice.

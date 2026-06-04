@@ -31,6 +31,7 @@ Usage:
 """
 
 import argparse
+import base64
 import glob
 import hashlib
 import json
@@ -98,9 +99,12 @@ def discover_profiles():
             found[cdir] = label_for(cdir)
 
     add(os.environ.get("CLAUDE_CONFIG_DIR"))
-    add(os.path.join(HOME, ".claude"))
+    # Named profiles before the bare default: when ~/.claude points at the same
+    # account as a ~/.claude-<name> dir, the named one is kept and the default
+    # collapses into it (see account dedup below) instead of being queried twice.
     for p in sorted(glob.glob(os.path.join(HOME, ".claude-*"))):
         add(p)
+    add(os.path.join(HOME, ".claude"))
     return [(label, cdir) for cdir, label in found.items()]
 
 
@@ -179,6 +183,31 @@ def load_credentials(config_dir):
         if oauth:
             return oauth, "keychain «%s»" % service
     return None, "credential not found (Keychain / file)"
+
+
+def account_id(oauth):
+    """Stable per-account key so the SAME Anthropic account is not queried twice
+    when it appears under several config dirs (e.g. ~/.claude and ~/.claude-personal
+    sharing one login — the rate limit is per account, so a second call gets 429).
+
+    Best-effort and local-only: decode the JWT access token's subject claim and
+    fall back to a hash of the token. The value is used purely for de-duplication;
+    it is never printed or sent anywhere.
+    """
+    tok = oauth.get("accessToken") or oauth.get("access_token") or ""
+    if not tok:
+        return None
+    parts = tok.split(".")
+    if len(parts) >= 2:
+        try:
+            seg = parts[1] + "=" * (-len(parts[1]) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(seg).decode("utf-8", "replace"))
+            for k in ("sub", "account_uuid", "account_id", "user_id", "uuid", "email"):
+                if claims.get(k):
+                    return "id:%s" % claims[k]
+        except Exception:
+            pass
+    return "tok:%s" % hashlib.sha256(tok.encode()).hexdigest()[:16]
 
 
 # ---- usage API -------------------------------------------------------------
@@ -336,43 +365,7 @@ def fmt_extra_usage(win):
 
 
 # ---- rendering -------------------------------------------------------------
-def render_profile(label, config_dir, raw=False, show_all=False):
-    print("%s%s● %s%s  %s(%s)%s" % (BOLD, CYN, label, RST, DIM, config_dir, RST))
-    oauth, source = load_credentials(config_dir)
-    if not oauth:
-        print("   %s%s%s\n" % (RED, source, RST))
-        return
-    token = oauth.get("accessToken") or oauth.get("access_token")
-    if not token:
-        print("   %sno accessToken in credential%s\n" % (RED, RST))
-        return
-
-    label_plan, sub, tier = plan_label(oauth)
-    print("   plan:   %s%s%s  %s(%s · rateLimitTier=%s)%s" % (BOLD, label_plan, RST, DIM, sub, tier, RST))
-    print("   %ssource: %s%s" % (DIM, source, RST))
-
-    status, data = fetch_usage(token)
-    stale_age = None
-    if status == 200 and isinstance(data, dict):
-        write_cache(config_dir, data)
-    else:
-        reason = failure_reason(status, data)
-        cached, ts = read_cache(config_dir)
-        if cached is not None:
-            data, stale_age = cached, ts
-            print("   %s⚠ live fetch failed (%s) — showing cache%s" % (YEL, reason, RST))
-        else:
-            print("   %sAPI failure: %s (no cache yet)%s\n" % (RED, reason, RST))
-            return
-
-    if stale_age is not None:
-        print("   %s⏁ cached %s%s" % (YEL, humanize_age(stale_age), RST))
-
-    if raw:
-        print(json.dumps(data, indent=2, ensure_ascii=False))
-        print()
-        return
-
+def render_windows(data, show_all=False):
     W = 14
     shown = set()
     for key, rotulo in WINDOWS:
@@ -406,6 +399,67 @@ def render_profile(label, config_dir, raw=False, show_all=False):
         rest = [k for k in data if k not in shown]
         if rest:
             print("   %s+ no data: %s%s" % (DIM, ", ".join(rest), RST))
+
+
+def render_profile(label, config_dir, seen, raw=False, show_all=False):
+    print("%s%s● %s%s  %s(%s)%s" % (BOLD, CYN, label, RST, DIM, config_dir, RST))
+    oauth, source = load_credentials(config_dir)
+    if not oauth:
+        print("   %s%s%s\n" % (RED, source, RST))
+        return
+    token = oauth.get("accessToken") or oauth.get("access_token")
+    if not token:
+        print("   %sno accessToken in credential%s\n" % (RED, RST))
+        return
+
+    label_plan, sub, tier = plan_label(oauth)
+    print("   plan:   %s%s%s  %s(%s · rateLimitTier=%s)%s" % (BOLD, label_plan, RST, DIM, sub, tier, RST))
+    print("   %ssource: %s%s" % (DIM, source, RST))
+
+    # Same account already fetched this run? Reuse it — never call the API twice
+    # for one account (that is what was triggering the 429).
+    aid = account_id(oauth)
+    if aid is not None and aid in seen:
+        prev_label, prev_data = seen[aid]
+        print("   %s↳ same account as «%s» — reused (no extra API call)%s" % (DIM, prev_label, RST))
+        if prev_data is None:
+            print("   %s(no data from that fetch)%s\n" % (DIM, RST))
+            return
+        if raw:
+            print(json.dumps(prev_data, indent=2, ensure_ascii=False))
+        else:
+            render_windows(prev_data, show_all)
+        print()
+        return
+
+    status, data = fetch_usage(token)
+    stale_age = None
+    if status == 200 and isinstance(data, dict):
+        write_cache(config_dir, data)
+    else:
+        reason = failure_reason(status, data)
+        cached, ts = read_cache(config_dir)
+        if cached is not None:
+            data, stale_age = cached, ts
+            print("   %s⚠ live fetch failed (%s) — showing cache%s" % (YEL, reason, RST))
+        else:
+            print("   %sAPI failure: %s (no cache yet)%s\n" % (RED, reason, RST))
+            if aid is not None:
+                seen[aid] = (label, None)  # mark attempted so duplicates don't re-call
+            return
+
+    if aid is not None:
+        seen.setdefault(aid, (label, data))
+
+    if stale_age is not None:
+        print("   %s⏁ cached %s%s" % (YEL, humanize_age(stale_age), RST))
+
+    if raw:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        print()
+        return
+
+    render_windows(data, show_all)
     print()
 
 
@@ -455,6 +509,11 @@ def selftest():
     check("failure_reason 429", "429" in failure_reason(429, {}))
     check("failure_reason 401", "401" in failure_reason(401, {}))
     check("humanize_age str", isinstance(humanize_age(time.time() - 120), str))
+
+    seg = base64.urlsafe_b64encode(json.dumps({"sub": "acc_X"}).encode()).decode().rstrip("=")
+    check("account_id from JWT sub", account_id({"accessToken": "h." + seg + ".s"}) == "id:acc_X")
+    check("account_id dedups same token", account_id({"accessToken": "z"}) == account_id({"access_token": "z"}))
+    check("account_id differs by token", account_id({"accessToken": "a"}) != account_id({"accessToken": "b"}))
 
     print("\n%s" % ("ALL OK" if ok else "FAILED"))
     return 0 if ok else 1
@@ -514,8 +573,9 @@ def main():
     def run_once():
         stamp = datetime.now().strftime("%d/%m %H:%M:%S")
         print("%sclaude-usage%s  %s%s%s\n" % (BOLD, RST, DIM, stamp, RST))
+        seen = {}  # account_id -> (label, data): fetch each account only once per run
         for label, cdir in chosen:
-            render_profile(label, cdir, raw=args.raw, show_all=args.show_all)
+            render_profile(label, cdir, seen, raw=args.raw, show_all=args.show_all)
 
     if args.watch:
         try:
