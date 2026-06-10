@@ -12,13 +12,14 @@ your login keeps working — see [Token refresh](#token-refresh). Disable with
 `--no-refresh` for strictly read-only behavior.
 
 ```
-claude-usage  03/06 18:11:31
+claude-usage  10/06 14:02:11
 
 ● personal  (/Users/you/.claude-personal)
-   plan:   Pro     (pro · rateLimitTier=default_claude_ai)
+   plan:   Pro  (pro · rateLimitTier=default_claude_ai)
    source: keychain «Claude Code-credentials-1a2b3c4d»
-   5h window      ████████░░░░░░░░░░░░  42.0% left  03/06 19:10 (in 58m)
-   7d window      ██████████████████░░  89.0% left  07/06 14:00 (in 3d19h)
+   ↻ OAuth token refreshed (rotated token saved back)
+   5h window      ████████░░░░░░░░░░░░   42.0% left  10/06 19:10 (in 58m)
+   7d window      ██████████████████░░   89.0% left  14/06 14:00 (in 3d19h)
    overage        enabled · 12.50/100.00 USD  (13% used)
    ─ local usage · last 30d · estimated from Claude Code logs at API rates ─
    today          $21.43 · 11M tokens
@@ -27,13 +28,25 @@ claude-usage  03/06 18:11:31
    trend          ▁▁▁▂▆▆▅█▅▃▃▂▂▄▂▂▃▂▁▁▁▁▂▃▁▁▂▃▃▄  peak 41M tok/day
    models         opus-4-8 42.2% · sonnet-4-6 21.7% · fable-5 5.1%
 
-● work      (/Users/you/.claude-work)
-   plan:   Max 5x  (max · rateLimitTier=default_claude_max_5x)
+● work  (/Users/you/.claude-work)
+   plan:   Max 20x  (max · rateLimitTier=default_claude_max_20x)
+   ↳ credential still says default_claude_max_5x — stale; live tier from the profile API
    source: keychain «Claude Code-credentials-5e6f7a8b»
-   5h window      █████████░░░░░░░░░░░░  45.0% left  03/06 20:10 (in 1h58m)
-   7d window      █████████████░░░░░░░  65.0% left  06/06 06:00 (in 2d11h)
+   5h window      █████████░░░░░░░░░░░   45.0% left  10/06 20:10 (in 1h58m)
+   7d window      █████████████░░░░░░░   65.0% left  13/06 06:00 (in 2d11h)
+   7d Sonnet      ████████████████████  100.0% left  13/06 06:00 (in 2d11h)
    overage        disabled
+   ─ local usage · last 30d · estimated from Claude Code logs at API rates ─
+   today          $98.15 · 68M tokens
+   yesterday      $221.30 · 239M tokens
+   last 30d       $5044.57 · 6.2B tokens
+   trend          ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▂▄▆▄▄▅▅▃▆▇▇██▄▂  peak 823M tok/day
+   models         opus-4-8 96% · haiku-4-5 2.5% · fable-5 0.7% · opus-4-7 0.7%
 ```
+
+When a profile's live fetch fails, the last good response is shown with the
+reason (`⏁ cached 2m ago — rate limited (429)`); profiles pointing at the same
+account collapse into one entry.
 
 ## Why
 
