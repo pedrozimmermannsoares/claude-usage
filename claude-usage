@@ -10,8 +10,13 @@ profile (a CLAUDE_CONFIG_DIR) it:
   3. prints the plan (Pro / Max 5x / Max 20x) and rate-limit windows as % remaining.
 
 Design / safety:
-  * NEVER writes to the Keychain, NEVER refreshes or rotates tokens (that would
-    invalidate your Claude Code login), and NEVER prints the token.
+  * NEVER prints tokens. While the access token is valid it only READS credentials.
+  * When the access token is EXPIRED (that profile hasn't run Claude Code in a
+    while) it refreshes it exactly like Claude Code does and writes the rotated
+    credential back to the same Keychain item / file. Anthropic refresh tokens
+    are SINGLE-USE, so saving the rotated token back is required to keep the
+    Claude Code login working. Opt out with --no-refresh (you'll see cached data
+    until Claude Code itself refreshes the token).
   * When the live API call fails (e.g. HTTP 429 rate limit), it falls back to the
     last cached response so you keep a view instead of an error.
   * All data stays local. The cache lives under $XDG_CACHE_HOME/claude-usage.
@@ -27,7 +32,15 @@ Usage:
   claude-usage --raw           # print the raw API JSON
   claude-usage --all           # also show empty / internal windows
   claude-usage --billing       # open the billing page (balance isn't in the API)
+  claude-usage --no-refresh    # strictly read-only: never refresh expired tokens
+  claude-usage --no-local      # skip the local cost/usage section (faster)
   claude-usage --selftest      # test pure functions (no Keychain / no network)
+
+The "local usage" block (cost & tokens per day, 30d trend, model split) is
+computed LOCALLY from Claude Code's own transcripts (<config_dir>/projects/
+*.jsonl), priced at API rates — the same approach as ccusage / OpenUsage.
+It's an estimate of what the usage WOULD cost on the API, not a bill.
+Per-file results are cached, so only changed transcripts are re-parsed.
 """
 
 import argparse
@@ -36,17 +49,24 @@ import glob
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 HOME = os.path.expanduser("~")
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 BILLING_URL = "https://claude.ai/settings/billing"
 BETA_HEADER = "oauth-2025-04-20"
 KEYCHAIN_PREFIX = "Claude Code-credentials"
+
+# OAuth refresh — same endpoint / public client_id Claude Code itself uses
+OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+OAUTH_SCOPES = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 
 # known rate-limit windows, in display order (extra_usage is handled separately)
 WINDOWS = [
@@ -163,15 +183,21 @@ def parse_oauth(blob):
 
 
 def load_credentials(config_dir):
-    """Return (oauth_dict, source_str) or (None, reason_str)."""
+    """Return (oauth_dict, source_str, store) or (None, reason_str, None).
+
+    `store` records where the credential lives ({"kind": "file"|"keychain", ...}
+    plus the parsed top-level blob) so a refreshed token can be written back to
+    the exact same place — see persist_credentials()."""
     # 1) credentials file (fallback / non-macOS platforms)
     fpath = os.path.join(config_dir, ".credentials.json")
     if os.path.isfile(fpath):
         try:
             with open(fpath) as fh:
-                oauth = parse_oauth(fh.read())
+                raw = fh.read()
+            oauth = parse_oauth(raw)
             if oauth:
-                return oauth, "file %s" % fpath
+                store = {"kind": "file", "path": fpath, "full": json.loads(raw)}
+                return oauth, "file %s" % fpath, store
         except Exception:
             pass
     # 2) macOS Keychain (candidate service names)
@@ -181,8 +207,30 @@ def load_credentials(config_dir):
             continue
         oauth = parse_oauth(blob)
         if oauth:
-            return oauth, "keychain «%s»" % service
-    return None, "credential not found (Keychain / file)"
+            store = {"kind": "keychain", "service": service, "full": json.loads(blob)}
+            return oauth, "keychain «%s»" % service, store
+    return None, "credential not found (Keychain / file)", None
+
+
+def account_uuid_for(config_dir):
+    """Account uuid for a config dir, read LOCALLY from Claude Code's own
+    .claude.json (oauthAccount.accountUuid). For the bare ~/.claude the file
+    lives NEXT TO the dir (~/.claude.json). Never printed — only used to group
+    profiles that belong to the same account."""
+    cdir = os.path.abspath(config_dir)
+    candidates = [os.path.join(cdir, ".claude.json")]
+    if os.path.basename(cdir) == ".claude":
+        candidates.append(os.path.join(os.path.dirname(cdir), ".claude.json"))
+    for path in candidates:
+        try:
+            with open(path) as fh:
+                obj = json.load(fh)
+            uuid = (obj.get("oauthAccount") or {}).get("accountUuid")
+            if uuid:
+                return str(uuid)
+        except Exception:
+            continue
+    return None
 
 
 def account_id(oauth):
@@ -210,13 +258,124 @@ def account_id(oauth):
     return "tok:%s" % hashlib.sha256(tok.encode()).hexdigest()[:16]
 
 
-# ---- usage API -------------------------------------------------------------
-def fetch_usage(access_token):
-    """Return (status_int, json_or_text). No external dependencies."""
+# ---- token refresh (only when expired; rotated token is saved back) ---------
+def token_expired(oauth, skew_ms=60000):
+    """True when the access token is past (or within skew_ms of) its expiry.
+    Unknown expiry counts as NOT expired — the API call itself will decide."""
+    exp = oauth.get("expiresAt") or oauth.get("expires_at")
+    if not isinstance(exp, (int, float)):
+        return False
+    return time.time() * 1000.0 >= float(exp) - skew_ms
+
+
+def refresh_oauth(oauth):
+    """Refresh the access token the same way Claude Code does. Mutates `oauth`
+    in place; returns (True, None) or (False, reason).
+
+    Anthropic refresh tokens ROTATE (single-use): the response carries a new
+    refresh_token and the old one is invalidated server-side, so the caller MUST
+    persist the mutated credential (persist_credentials) or the Claude Code
+    login for this profile breaks on its own next refresh."""
     import urllib.request
     import urllib.error
 
-    req = urllib.request.Request(USAGE_URL, method="GET")
+    rtok = oauth.get("refreshToken") or oauth.get("refresh_token")
+    if not rtok:
+        return False, "access token expired and credential has no refreshToken"
+    scopes = oauth.get("scopes")
+    scope = " ".join(scopes) if isinstance(scopes, list) and scopes else OAUTH_SCOPES
+    payload = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": rtok,
+        "client_id": OAUTH_CLIENT_ID,
+        "scope": scope,
+    }).encode()
+    req = urllib.request.Request(OAUTH_TOKEN_URL, data=payload, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", "claude-usage-cli")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 401):
+            return False, "refresh token rejected (HTTP %d) — run Claude Code in this profile to log in again" % e.code
+        return False, "token refresh failed: HTTP %d" % e.code
+    except Exception as e:
+        return False, "token refresh failed: %s" % e
+    tok = body.get("access_token")
+    if not tok:
+        return False, "token refresh failed: no access_token in response"
+    oauth["accessToken"] = tok
+    oauth.pop("access_token", None)
+    if body.get("refresh_token"):
+        oauth["refreshToken"] = body["refresh_token"]
+        oauth.pop("refresh_token", None)
+    if isinstance(body.get("expires_in"), (int, float)):
+        oauth["expiresAt"] = int(time.time() * 1000 + body["expires_in"] * 1000)
+    return True, None
+
+
+def parse_keychain_account(find_output):
+    """Pull the account name out of `security find-generic-password` output:
+    it appears as "acct"<blob>="name" (or 0x<hex> for non-ASCII names)."""
+    m = re.search(r'"acct"<blob>=(?:"((?:[^"\\]|\\.)*)"|0x([0-9A-Fa-f]+))', find_output or "")
+    if not m:
+        return None
+    if m.group(1) is not None:
+        return m.group(1)
+    try:
+        return bytes.fromhex(m.group(2)).decode("utf-8", "replace").rstrip("\x00")
+    except Exception:
+        return None
+
+
+def persist_credentials(store, oauth):
+    """Write the refreshed credential back to where it was read from, in Claude
+    Code's own format. Returns (ok, reason). The JSON MUST be minified: the
+    `security` CLI hex-encodes multi-line values, which Claude Code can't read
+    back and would treat as an invalid session."""
+    if not store:
+        return False, "unknown credential source"
+    full = store.get("full")
+    if isinstance(full, dict) and isinstance(full.get("claudeAiOauth"), dict):
+        full = dict(full)
+        full["claudeAiOauth"] = oauth
+    else:
+        full = oauth
+    blob = json.dumps(full, separators=(",", ":"))
+    if store["kind"] == "file":
+        try:
+            tmp = store["path"] + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(blob)
+            os.replace(tmp, store["path"])
+            return True, None
+        except Exception as e:
+            return False, "could not write %s: %s" % (store["path"], e)
+    # keychain: update the SAME item (service + account) Claude Code reads
+    try:
+        out = subprocess.run(["security", "find-generic-password", "-s", store["service"]],
+                             capture_output=True, text=True, timeout=30)
+        acct = parse_keychain_account(out.stdout) or os.environ.get("USER") or ""
+        upd = subprocess.run(
+            ["security", "add-generic-password", "-U", "-a", acct, "-s", store["service"], "-w", blob],
+            capture_output=True, text=True, timeout=30)
+        if upd.returncode != 0:
+            return False, "keychain update failed: %s" % (upd.stderr.strip() or "exit %d" % upd.returncode)
+        return True, None
+    except Exception as e:
+        return False, "keychain update failed: %s" % e
+
+
+# ---- usage API -------------------------------------------------------------
+def api_get(url, access_token):
+    """GET an OAuth endpoint. Return (status_int, json_or_text). Stdlib only."""
+    import urllib.request
+    import urllib.error
+
+    req = urllib.request.Request(url, method="GET")
     req.add_header("Authorization", "Bearer %s" % access_token)
     req.add_header("anthropic-beta", BETA_HEADER)
     req.add_header("Accept", "application/json")
@@ -236,6 +395,30 @@ def fetch_usage(access_token):
             return e.code, body
     except Exception as e:
         return 0, "network error: %s" % e
+
+
+def fetch_usage(access_token):
+    return api_get(USAGE_URL, access_token)
+
+
+def live_tier(data):
+    """Pull organization.rate_limit_tier out of a /profile response, else None."""
+    if isinstance(data, dict) and isinstance(data.get("organization"), dict):
+        t = data["organization"].get("rate_limit_tier")
+        if t:
+            return str(t)
+    return None
+
+
+def fetch_profile_tier(access_token):
+    """The account's CURRENT rate_limit_tier from the profile endpoint, or None.
+    The rateLimitTier stored in the credential goes stale when the subscription
+    changes (Claude Code only rewrites it on login), so the live value wins.
+    Only the tier string is kept — names/emails in the response are discarded."""
+    status, data = api_get(PROFILE_URL, access_token)
+    if status == 200:
+        return live_tier(data)
+    return None
 
 
 def failure_reason(status, data):
@@ -262,12 +445,12 @@ def cache_file(config_dir):
     return os.path.join(cache_dir(), h + ".json")
 
 
-def write_cache(config_dir, data):
+def write_cache(config_dir, data, tier=None):
     try:
         os.makedirs(cache_dir(), exist_ok=True)
         tmp = cache_file(config_dir) + ".tmp"
         with open(tmp, "w") as fh:
-            json.dump({"fetched_at": time.time(), "data": data}, fh)
+            json.dump({"fetched_at": time.time(), "data": data, "tier": tier}, fh)
         os.replace(tmp, cache_file(config_dir))
     except Exception:
         pass  # cache is best-effort
@@ -277,9 +460,9 @@ def read_cache(config_dir):
     try:
         with open(cache_file(config_dir)) as fh:
             obj = json.load(fh)
-        return obj.get("data"), obj.get("fetched_at")
+        return obj.get("data"), obj.get("fetched_at"), obj.get("tier")
     except Exception:
-        return None, None
+        return None, None, None
 
 
 def fingerprint(data):
@@ -328,6 +511,200 @@ def save_fp(config_dir, fp):
         pass
 
 
+# ---- local usage cost (from Claude Code JSONL transcripts) ------------------
+# Same approach as ccusage / OpenUsage: parse <config_dir>/projects/**/*.jsonl,
+# dedup by message.id + requestId (resumed sessions re-write the same entries),
+# and price tokens at API rates. Estimates only — subscriptions aren't billed
+# per token. Prices are $/MTok; cache write costs 1.25x input (5m TTL) or
+# 2x (1h TTL); cache reads cost 0.1x input.
+USAGE_CACHE_VERSION = 1
+MODEL_PRICES = [  # first substring match wins — keep specific entries first
+    ("fable-5", (10.0, 50.0)),
+    ("opus-4-8", (5.0, 25.0)),
+    ("opus-4-7", (5.0, 25.0)),
+    ("opus-4-6", (5.0, 25.0)),
+    ("opus-4-5", (5.0, 25.0)),
+    ("opus", (15.0, 75.0)),      # opus 4.1 / 4.0 / 3
+    ("sonnet", (3.0, 15.0)),
+    ("haiku-4-5", (1.0, 5.0)),
+    ("haiku-3-5", (0.8, 4.0)),
+    ("haiku", (0.25, 1.25)),
+]
+
+
+def model_price(model):
+    m = (model or "").lower()
+    for frag, price in MODEL_PRICES:
+        if frag in m:
+            return price
+    return None
+
+
+def entry_tokens(usage):
+    """Total tokens of one assistant message: input + output + cache write/read
+    (matches how OpenUsage/ccusage count 'tokens')."""
+    total = 0
+    for k in ("input_tokens", "output_tokens",
+              "cache_creation_input_tokens", "cache_read_input_tokens"):
+        v = usage.get(k)
+        if isinstance(v, (int, float)) and v > 0:
+            total += int(v)
+    return total
+
+
+def entry_cost(model, usage, precomputed=None):
+    """USD cost of one assistant message. Prefers the costUSD some Claude Code
+    versions precompute; otherwise prices the token counts."""
+    if isinstance(precomputed, (int, float)) and precomputed > 0:
+        return float(precomputed)
+    price = model_price(model)
+    if not price:
+        return 0.0
+    inp, out = price
+    cin = float(usage.get("input_tokens") or 0)
+    cout = float(usage.get("output_tokens") or 0)
+    cread = float(usage.get("cache_read_input_tokens") or 0)
+    cc = usage.get("cache_creation") or {}
+    cw5 = float(cc.get("ephemeral_5m_input_tokens") or 0)
+    cw1 = float(cc.get("ephemeral_1h_input_tokens") or 0)
+    if not cw5 and not cw1:
+        cw5 = float(usage.get("cache_creation_input_tokens") or 0)
+    return (cin * inp + cout * out + cread * inp * 0.1
+            + cw5 * inp * 1.25 + cw1 * inp * 2.0) / 1e6
+
+
+def parse_transcript(path, cutoff_ts):
+    """One JSONL transcript -> compact entries [uid16, ts, model, tokens, cost].
+    uid is None when message.id/requestId are missing (then it always counts)."""
+    out = []
+    try:
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                if '"assistant"' not in line or '"usage"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("type") != "assistant":
+                    continue
+                msg = obj.get("message") or {}
+                usage = msg.get("usage")
+                if not isinstance(usage, dict):
+                    continue
+                model = str(msg.get("model") or "")
+                if not model or model == "<synthetic>":
+                    continue
+                try:
+                    ts = datetime.fromisoformat(
+                        str(obj.get("timestamp")).replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    continue
+                if ts < cutoff_ts:
+                    continue
+                tokens = entry_tokens(usage)
+                if tokens <= 0:
+                    continue
+                mid, rid = msg.get("id"), obj.get("requestId")
+                uid = (hashlib.sha256(("%s:%s" % (mid, rid)).encode()).hexdigest()[:16]
+                       if mid and rid else None)
+                out.append([uid, ts, model,
+                            tokens, round(entry_cost(model, usage, obj.get("costUSD")), 6)])
+    except Exception:
+        pass
+    return out
+
+
+def usage_cache_file(config_dir):
+    h = hashlib.sha256(os.path.abspath(config_dir).encode()).hexdigest()[:16]
+    return os.path.join(cache_dir(), "usage-" + h + ".json")
+
+
+def local_usage(config_dir, days=30):
+    """Aggregate the last `days` days of transcript usage for one profile.
+    Incremental: per-file entries are cached keyed by (mtime, size); only
+    files changed since the previous run are re-parsed."""
+    proj = os.path.join(config_dir, "projects")
+    if not os.path.isdir(proj):
+        return None
+    today = datetime.now().date()
+    start = datetime.combine(today - timedelta(days=days - 1), datetime.min.time())
+    cutoff_ts = start.timestamp()
+
+    try:
+        with open(usage_cache_file(config_dir)) as fh:
+            cache = json.load(fh)
+        if cache.get("version") != USAGE_CACHE_VERSION:
+            cache = {}
+    except Exception:
+        cache = {}
+    old_files = cache.get("files") or {}
+
+    files, todo = {}, []
+    for root, _dirs, names in os.walk(proj):
+        for name in names:
+            if not name.endswith(".jsonl"):
+                continue
+            path = os.path.join(root, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if st.st_mtime < cutoff_ts:
+                continue  # nothing in range can be inside
+            prev = old_files.get(path)
+            if prev and prev.get("mtime") == st.st_mtime and prev.get("size") == st.st_size:
+                files[path] = prev
+            else:
+                todo.append((path, st))
+    if len(todo) > 50:
+        sys.stderr.write("claude-usage: indexing %d transcript files under %s "
+                         "(first run can take a while; later runs are incremental)\n"
+                         % (len(todo), proj))
+    for path, st in todo:
+        files[path] = {"mtime": st.st_mtime, "size": st.st_size,
+                       "entries": parse_transcript(path, cutoff_ts)}
+
+    try:  # persist; keeping only still-relevant paths prunes stale ones
+        os.makedirs(cache_dir(), exist_ok=True)
+        tmp = usage_cache_file(config_dir) + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump({"version": USAGE_CACHE_VERSION, "files": files}, fh)
+        os.replace(tmp, usage_cache_file(config_dir))
+    except Exception:
+        pass
+
+    seen = set()
+    day_tokens, day_cost, model_tokens = {}, {}, {}
+    for f in files.values():
+        for uid, ts, model, tokens, cost in f["entries"]:
+            if ts < cutoff_ts:
+                continue
+            if uid:
+                if uid in seen:
+                    continue
+                seen.add(uid)
+            day = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+            day_tokens[day] = day_tokens.get(day, 0) + tokens
+            day_cost[day] = day_cost.get(day, 0.0) + cost
+            model_tokens[model] = model_tokens.get(model, 0) + tokens
+    if not day_tokens:
+        return None
+    return {"day_tokens": day_tokens, "day_cost": day_cost, "model_tokens": model_tokens}
+
+
+def merge_local(a, b):
+    """Merge two local_usage() results (profiles collapsed into one account)."""
+    if not b:
+        return a
+    if not a:
+        return {k: dict(v) for k, v in b.items()}
+    for k in ("day_tokens", "day_cost", "model_tokens"):
+        for kk, vv in b[k].items():
+            a[k][kk] = a[k].get(kk, 0) + vv
+    return a
+
+
 # ---- formatting ------------------------------------------------------------
 def humanize_reset(iso):
     if not iso:
@@ -363,6 +740,46 @@ def humanize_age(ts):
     return "%dd ago" % (secs // 86400)
 
 
+def fmt_tokens(n):
+    """11_000_000 -> '11M', 6_600_000 -> '6.6M', 1500 -> '1.5K' (OpenUsage style)."""
+    n = int(n)
+    sign, a = ("-" if n < 0 else ""), abs(n)
+    for threshold, divisor, suffix in ((1e9, 1e9, "B"), (1e6, 1e6, "M"), (1e3, 1e3, "K")):
+        if a >= threshold:
+            scaled = a / divisor
+            if scaled >= 10:
+                return "%s%d%s" % (sign, round(scaled), suffix)
+            txt = "%.1f" % scaled
+            if txt.endswith(".0"):
+                txt = txt[:-2]
+            return sign + txt + suffix
+    return "%s%d" % (sign, a)
+
+
+def percent_label(v):
+    """56.123 -> '56.1%', 19.0 -> '19%', 0.05 -> '<0.1%' (OpenUsage style)."""
+    if 0 < v < 0.1:
+        return "<0.1%"
+    r = round(v * 10) / 10.0
+    return ("%d%%" % round(r)) if r == int(r) else ("%.1f%%" % r)
+
+
+def shorten_model(model):
+    """'claude-haiku-4-5-20251001' -> 'haiku-4-5' (for compact display)."""
+    m = re.sub(r"-\d{8}$", "", model or "")
+    return m[7:] if m.startswith("claude-") else m
+
+
+def sparkline(values):
+    """One block char per value, scaled to the max (zero -> baseline ▁)."""
+    blocks = "▁▂▃▄▅▆▇█"
+    peak = max(values) if values else 0
+    if peak <= 0:
+        return blocks[0] * len(values)
+    return "".join(blocks[0] if v <= 0 else blocks[1 + int(round(6.0 * v / peak))]
+                   for v in values)
+
+
 def bar(remaining, width=20):
     """Bar of what's LEFT: full/green = plenty remaining, empty/red = nearly out."""
     r = max(0.0, min(100.0, float(remaining)))
@@ -371,10 +788,12 @@ def bar(remaining, width=20):
     return "%s%s%s%s" % (color, "█" * fill, RST, "░" * (width - fill))
 
 
-def plan_label(oauth):
-    """Return (label, subscriptionType, rateLimitTier)."""
+def plan_label(oauth, live_tier=None):
+    """Return (label, subscriptionType, rateLimitTier). `live_tier` (from the
+    profile endpoint) wins over the credential's stored rateLimitTier, which goes
+    stale when the subscription changes (Claude Code only rewrites it on login)."""
     sub = str(oauth.get("subscriptionType") or oauth.get("subscription_type") or "?")
-    tier = str(oauth.get("rateLimitTier") or oauth.get("rate_limit_tier") or "?")
+    tier = str(live_tier or oauth.get("rateLimitTier") or oauth.get("rate_limit_tier") or "?")
     label = TIER_LABELS.get(tier)
     if not label:
         t = tier.lower()
@@ -400,14 +819,17 @@ def fmt_window(win):
 
 
 def fmt_extra_usage(win):
-    """Format the on-demand overage block (NOT the prepaid billing balance)."""
+    """Format the on-demand overage block (NOT the prepaid billing balance).
+    used_credits / monthly_limit come from the API in CENTS."""
     if not win.get("is_enabled"):
         return "%sdisabled%s" % (DIM, RST)
-    used = win.get("used_credits") or 0
+    used = float(win.get("used_credits") or 0) / 100.0
     limit = win.get("monthly_limit")
     cur = (win.get("currency") or "").strip()
-    lim_s = ("%g" % limit) if isinstance(limit, (int, float)) else "∞"
-    return "enabled · %g/%s %s" % (float(used), lim_s, cur)
+    lim_s = ("%.2f" % (float(limit) / 100.0)) if isinstance(limit, (int, float)) else "∞"
+    util = win.get("utilization")
+    pct = "  %s(%.0f%% used)%s" % (DIM, float(util), RST) if isinstance(util, (int, float)) else ""
+    return "enabled · %.2f/%s %s%s" % (used, lim_s, cur, pct)
 
 
 # ---- rendering -------------------------------------------------------------
@@ -447,31 +869,86 @@ def render_windows(data, show_all=False):
             print("   %s+ no data: %s%s" % (DIM, ", ".join(rest), RST))
 
 
-def gather(label, config_dir):
+def render_local(loc, days=30):
+    """The OpenUsage-style block: cost+tokens today / yesterday / 30d, a daily
+    token sparkline, and the per-model token share."""
+    W = 14
+    day_cost, day_tokens = loc["day_cost"], loc["day_tokens"]
+    today = datetime.now().date()
+    keys = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days - 1, -1, -1)]
+
+    def money_line(cost, tokens):
+        return "%s$%.2f%s · %s tokens" % (BOLD, cost, RST, fmt_tokens(tokens))
+
+    print("   %s─ local usage · last %dd · estimated from Claude Code logs at API rates ─%s"
+          % (DIM, days, RST))
+    print("   %-*s %s" % (W, "today", money_line(day_cost.get(keys[-1], 0.0), day_tokens.get(keys[-1], 0))))
+    print("   %-*s %s" % (W, "yesterday", money_line(day_cost.get(keys[-2], 0.0), day_tokens.get(keys[-2], 0))))
+    print("   %-*s %s" % (W, "last %dd" % days, money_line(sum(day_cost.values()), sum(day_tokens.values()))))
+    tokens_per_day = [day_tokens.get(k, 0) for k in keys]
+    print("   %-*s %s%s%s  %speak %s tok/day%s" % (
+        W, "trend", YEL, sparkline(tokens_per_day), RST,
+        DIM, fmt_tokens(max(tokens_per_day)), RST))
+    models = sorted(loc["model_tokens"].items(), key=lambda kv: -kv[1])
+    total = sum(t for _m, t in models) or 1
+    parts = ["%s %s%s%s" % (shorten_model(m), BOLD, percent_label(100.0 * t / total), RST)
+             for m, t in models[:6]]
+    if len(models) > 6:
+        parts.append("%s+%d more%s" % (DIM, len(models) - 6, RST))
+    print("   %-*s %s" % (W, "models", (" %s·%s " % (DIM, RST)).join(parts)))
+
+
+def gather(label, config_dir, allow_refresh=True, allow_local=True):
     """Fetch one profile's usage (live, falling back to cache) and tag it with the
     account fingerprint. Returns a result dict consumed by the grouping step."""
     res = {"label": label, "config_dir": config_dir, "oauth": None,
-           "source": None, "data": None, "stale_age": None, "reason": None, "fp": None}
-    oauth, source = load_credentials(config_dir)
+           "source": None, "data": None, "stale_age": None, "reason": None, "fp": None,
+           "refreshed": False, "persist_warn": None, "tier": None, "local": None,
+           "account": account_uuid_for(config_dir)}
+    if allow_local:
+        res["local"] = local_usage(config_dir)
+    oauth, source, store = load_credentials(config_dir)
     res["source"] = source
     if not oauth:
         res["reason"] = source
         return res
     res["oauth"] = oauth
+
+    def do_refresh():
+        ok, why = refresh_oauth(oauth)
+        if not ok:
+            return why
+        res["refreshed"] = True
+        saved, err = persist_credentials(store, oauth)
+        if not saved:
+            res["persist_warn"] = err
+        return None
+
+    refresh_err = None
+    if allow_refresh and token_expired(oauth):
+        refresh_err = do_refresh()
+
     token = oauth.get("accessToken") or oauth.get("access_token")
     if not token:
         res["reason"] = "no accessToken in credential"
         return res
 
     status, data = fetch_usage(token)
+    if status == 401 and allow_refresh and not res["refreshed"] and refresh_err is None:
+        refresh_err = do_refresh()
+        if refresh_err is None:
+            status, data = fetch_usage(oauth.get("accessToken"))
+    tier = fetch_profile_tier(oauth.get("accessToken") or oauth.get("access_token"))
     if status == 200 and isinstance(data, dict):
-        write_cache(config_dir, data)
+        write_cache(config_dir, data, tier)
         res["data"] = data
     else:
-        res["reason"] = failure_reason(status, data)
-        cached, ts = read_cache(config_dir)
+        res["reason"] = refresh_err or failure_reason(status, data)
+        cached, ts, cached_tier = read_cache(config_dir)
         if cached is not None:
             res["data"], res["stale_age"] = cached, ts
+            tier = tier or cached_tier
+    res["tier"] = tier
 
     fp = fingerprint(res["data"])
     if fp:
@@ -483,9 +960,12 @@ def gather(label, config_dir):
 
 
 def group_key(res):
-    """Key that groups profiles belonging to the same account. Prefer the usage
-    fingerprint (matches across different tokens of one account); fall back to the
-    token hash (matches byte-identical/copied logins); else the dir (stays unique)."""
+    """Key that groups profiles belonging to the same account. Prefer the LOCAL
+    account uuid from .claude.json (exact, no network); then the usage
+    fingerprint (matches across different tokens of one account); then the
+    token hash (matches byte-identical/copied logins); else the dir."""
+    if res.get("account"):
+        return "acct:" + res["account"]
     if res.get("fp"):
         return "fp:" + res["fp"]
     oauth = res.get("oauth") or {}
@@ -506,8 +986,12 @@ def render_group(members, raw=False, show_all=False):
     if oauth is None:
         print("   %s%s%s\n" % (RED, top.get("reason") or "credential not found", RST))
         return
-    plan, sub, tier = plan_label(oauth)
+    known_tier = next((m.get("tier") for m in members if m.get("tier")), None)
+    plan, sub, tier = plan_label(oauth, known_tier)
     print("   plan:   %s%s%s  %s(%s · rateLimitTier=%s)%s" % (BOLD, plan, RST, DIM, sub, tier, RST))
+    stored_tier = oauth.get("rateLimitTier") or oauth.get("rate_limit_tier")
+    if known_tier and stored_tier and known_tier != stored_tier:
+        print("   %s↳ credential still says %s — stale; live tier from the profile API%s" % (DIM, stored_tier, RST))
     print("   %ssource: %s%s" % (DIM, top.get("source"), RST))
 
     if len(members) > 1:
@@ -520,14 +1004,27 @@ def render_group(members, raw=False, show_all=False):
     if data_member is not top:
         print("   %s↳ data via «%s» — «%s» token unavailable (%s)%s" % (
             YEL, data_member["label"], top["label"], top.get("reason"), RST))
+    for m in members:
+        if m.get("refreshed"):
+            print("   %s↻ OAuth token refreshed (rotated token saved back)%s" % (DIM, RST))
+        if m.get("persist_warn"):
+            print("   %s⚠ refreshed token NOT saved back (%s) — Claude Code may ask to log in again in this profile%s" % (
+                RED, m["persist_warn"], RST))
     if data_member.get("stale_age") is not None:
-        print("   %s⏁ cached %s%s" % (YEL, humanize_age(data_member["stale_age"]), RST))
+        print("   %s⏁ cached %s — %s%s" % (
+            YEL, humanize_age(data_member["stale_age"]),
+            data_member.get("reason") or "live fetch failed", RST))
 
     if raw:
         print(json.dumps(data_member["data"], indent=2, ensure_ascii=False))
         print()
         return
     render_windows(data_member["data"], show_all)
+    loc = None
+    for m in members:
+        loc = merge_local(loc, m.get("local"))
+    if loc:
+        render_local(loc)
     print()
 
 
@@ -555,7 +1052,7 @@ def debug_accounts(chosen):
     print("debug-accounts (names + hashed values only; no tokens, no raw values)\n")
     for label, cdir in chosen:
         print("● %s  (%s)" % (label, cdir))
-        oauth, source = load_credentials(cdir)
+        oauth, source, _store = load_credentials(cdir)
         if not oauth:
             print("   %s\n" % source)
             continue
@@ -587,7 +1084,6 @@ def debug_accounts(chosen):
 
 # ---- selftest (no Keychain / no network / no personal data) ----------------
 def selftest():
-    import re
     ok = True
 
     def check(name, cond):
@@ -604,6 +1100,12 @@ def selftest():
     check("plan Max 5x", plan_label({"rateLimitTier": "default_claude_max_5x"})[0] == "Max 5x")
     check("plan Pro", plan_label({"subscriptionType": "pro", "rateLimitTier": "default_claude_ai"})[0] == "Pro")
     check("plan unknown tier falls back to sub", plan_label({"subscriptionType": "team"})[0] == "team")
+    check("plan live tier beats stale credential",
+          plan_label({"rateLimitTier": "default_claude_max_5x"}, "default_claude_max_20x")[0] == "Max 20x")
+    check("plan no live tier -> stored", plan_label({"rateLimitTier": "default_claude_max_5x"}, None)[0] == "Max 5x")
+    check("live_tier extracts org tier",
+          live_tier({"organization": {"rate_limit_tier": "default_claude_max_20x"}}) == "default_claude_max_20x")
+    check("live_tier none on junk", live_tier({"organization": {}}) is None and live_tier("x") is None)
 
     check("parse_oauth wrapper", (parse_oauth('{"claudeAiOauth":{"accessToken":"x"}}') or {}).get("accessToken") == "x")
     check("parse_oauth flat", (parse_oauth('{"access_token":"y"}') or {}).get("access_token") == "y")
@@ -614,6 +1116,48 @@ def selftest():
     check("fmt_extra_usage disabled", "disabled" in fmt_extra_usage({"is_enabled": False}))
     check("fmt_extra_usage enabled",
           "enabled" in fmt_extra_usage({"is_enabled": True, "used_credits": 0.0, "monthly_limit": 100, "currency": "USD"}))
+    check("fmt_extra_usage cents -> currency units",
+          "199.21/550.00 BRL" in fmt_extra_usage(
+              {"is_enabled": True, "used_credits": 19921.0, "monthly_limit": 55000, "currency": "BRL"}))
+
+    check("fmt_tokens 11M", fmt_tokens(11_000_000) == "11M")
+    check("fmt_tokens 6.6M", fmt_tokens(6_600_000) == "6.6M")
+    check("fmt_tokens 2M (no .0)", fmt_tokens(2_000_000) == "2M")
+    check("fmt_tokens 1.5K", fmt_tokens(1_500) == "1.5K")
+    check("fmt_tokens plain", fmt_tokens(950) == "950")
+    check("percent_label 56.1%", percent_label(56.123) == "56.1%")
+    check("percent_label 19%", percent_label(19.0) == "19%")
+    check("percent_label <0.1%", percent_label(0.05) == "<0.1%")
+    check("shorten_model strips prefix+date",
+          shorten_model("claude-haiku-4-5-20251001") == "haiku-4-5")
+    check("sparkline shape", sparkline([0, 5, 10]) == "▁▅█")
+    check("group_key by account uuid", group_key({"account": "u1", "fp": "x"}) == "acct:u1")
+    check("sparkline all zero", sparkline([0, 0]) == "▁▁")
+    check("model_price opus-4-7", model_price("claude-opus-4-7") == (5.0, 25.0))
+    check("model_price fable", model_price("claude-fable-5") == (10.0, 50.0))
+    check("model_price unknown", model_price("gpt-4o") is None)
+    check("entry_tokens sums all kinds",
+          entry_tokens({"input_tokens": 1, "output_tokens": 2,
+                        "cache_creation_input_tokens": 3, "cache_read_input_tokens": 4}) == 10)
+    check("entry_cost plain in/out",
+          abs(entry_cost("claude-sonnet-4-6", {"input_tokens": 1_000_000}) - 3.0) < 1e-9)
+    check("entry_cost cache rates",  # 1M cache-read = 0.1x input; 1M 1h-write = 2x input
+          abs(entry_cost("claude-sonnet-4-6",
+                         {"cache_read_input_tokens": 1_000_000,
+                          "cache_creation": {"ephemeral_1h_input_tokens": 1_000_000}}) - 6.3) < 1e-9)
+    check("entry_cost precomputed wins",
+          entry_cost("claude-sonnet-4-6", {"input_tokens": 1_000_000}, 1.23) == 1.23)
+    check("merge_local sums",
+          merge_local({"day_tokens": {"d": 1}, "day_cost": {"d": 1.0}, "model_tokens": {"m": 1}},
+                      {"day_tokens": {"d": 2}, "day_cost": {"d": 0.5}, "model_tokens": {"m": 2}}
+                      )["day_tokens"]["d"] == 3)
+
+    check("token_expired past", token_expired({"expiresAt": (time.time() - 10) * 1000}))
+    check("token_expired future", not token_expired({"expiresAt": (time.time() + 3600) * 1000}))
+    check("token_expired unknown -> False", not token_expired({}))
+    check("keychain acct quoted", parse_keychain_account('    "acct"<blob>="pedro"') == "pedro")
+    check("keychain acct hex", parse_keychain_account('"acct"<blob>=0x706564726f  "pedro"') == "pedro")
+    check("keychain acct missing", parse_keychain_account("nothing here") is None)
 
     check("failure_reason 429", "429" in failure_reason(429, {}))
     check("failure_reason 401", "401" in failure_reason(401, {}))
@@ -652,6 +1196,10 @@ def main():
                     help="diagnose how profiles map to accounts (safe: field names + hashes only)")
     ap.add_argument("--include-default", action="store_true", dest="include_default",
                     help="also show the bare ~/.claude profile (hidden by default when named profiles exist)")
+    ap.add_argument("--no-refresh", action="store_true", dest="no_refresh",
+                    help="strictly read-only: never refresh expired OAuth tokens (may serve stale cache)")
+    ap.add_argument("--no-local", action="store_true", dest="no_local",
+                    help="skip the local cost/usage section (no transcript parsing)")
     ap.add_argument("--selftest", action="store_true",
                     help="test pure functions (no Keychain / no network)")
     args = ap.parse_args()
@@ -666,6 +1214,7 @@ def main():
         return 0
 
     discovered = discover_profiles()
+    hidden_default_dir = None
     by_label = {}
     for lbl, d in discovered:
         by_label.setdefault(lbl, d)
@@ -692,6 +1241,8 @@ def main():
         env_is_default = bool(env) and os.path.abspath(os.path.expanduser(env)) == default_abs
         named_exist = any(d != default_abs for _, d in chosen)
         if named_exist and not env_is_default and not args.include_default:
+            if any(d == default_abs for _, d in chosen):
+                hidden_default_dir = default_abs
             chosen = [(l, d) for (l, d) in chosen if d != default_abs]
 
     if not chosen:
@@ -705,7 +1256,20 @@ def main():
     def run_once():
         stamp = datetime.now().strftime("%d/%m %H:%M:%S")
         print("%sclaude-usage%s  %s%s%s\n" % (BOLD, RST, DIM, stamp, RST))
-        results = [gather(label, cdir) for (label, cdir) in chosen]  # priority order
+        results = [gather(label, cdir, allow_refresh=not args.no_refresh,
+                          allow_local=not args.no_local)
+                   for (label, cdir) in chosen]  # priority order
+        # The hidden bare ~/.claude still accrues transcripts (it's the same
+        # login as one of the named profiles) — fold its LOCAL usage into the
+        # profile with the same account uuid so today's costs aren't missed.
+        if hidden_default_dir and not args.no_local:
+            acct = account_uuid_for(hidden_default_dir)
+            extra = local_usage(hidden_default_dir)
+            if acct and extra:
+                for r in results:
+                    if r.get("account") == acct:
+                        r["local"] = merge_local(r.get("local"), extra)
+                        break
         groups, index = [], {}
         for r in results:
             k = group_key(r)
