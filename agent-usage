@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+"""
+agent-usage — unified read-only view of agent-tool usage & quotas.
+
+Combines:
+  * Claude Code profiles  → claude-usage logic (OAuth usage API, 5h/7d windows)
+  * Cursor                → api2.cursor.sh/auth/usage-summary (Keychain token)
+  * Codex                 → rate_limits from ~/.codex session logs + ccusage tokens
+  * OpenCode              → ccusage tokens (when logs exist)
+
+Zero dependencies (Python 3.8+ stdlib). Never prints tokens or secrets.
+Network failures fall back to local cache under $XDG_CACHE_HOME/agent-usage.
+"""
+
+import argparse
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CURSOR_USAGE_URL = "https://api2.cursor.sh/auth/usage-summary"
+CURSOR_KEYCHAIN_SERVICE = "cursor-access-token"
+CURSOR_KEYCHAIN_ACCOUNT = "cursor-user"
+
+# ---- colors ----------------------------------------------------------------
+def _c(code):
+    return code if sys.stdout.isatty() else ""
+
+BOLD, DIM, RED, GRN, YEL, CYN, MAG, RST = (
+    _c("\033[1m"), _c("\033[2m"), _c("\033[31m"),
+    _c("\033[32m"), _c("\033[33m"), _c("\033[36m"),
+    _c("\033[35m"), _c("\033[0m"),
+)
+
+
+# ---- cache -----------------------------------------------------------------
+def cache_dir():
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache")
+    return os.path.join(base, "agent-usage")
+
+
+def read_cache(name):
+    path = os.path.join(cache_dir(), name)
+    try:
+        with open(path) as fh:
+            obj = json.load(fh)
+        return obj.get("data"), obj.get("fetched_at")
+    except Exception:
+        return None, None
+
+
+def write_cache(name, data):
+    try:
+        os.makedirs(cache_dir(), exist_ok=True)
+        path = os.path.join(cache_dir(), name)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump({"fetched_at": time.time(), "data": data}, fh)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def humanize_age(ts):
+    if not ts:
+        return "unknown age"
+    secs = int(time.time() - ts)
+    if secs < 60:
+        return "%ds ago" % secs
+    if secs < 3600:
+        return "%dm ago" % (secs // 60)
+    if secs < 86400:
+        return "%dh%02dm ago" % (secs // 3600, (secs % 3600) // 60)
+    return "%dd ago" % (secs // 86400)
+
+
+def humanize_reset_epoch(epoch):
+    if not epoch:
+        return ""
+    try:
+        dt = datetime.fromtimestamp(float(epoch), tz=timezone.utc)
+    except Exception:
+        return str(epoch)
+    secs = int((dt - datetime.now(timezone.utc)).total_seconds())
+    if secs <= 0:
+        rel = "now"
+    elif secs < 3600:
+        rel = "in %dm" % (secs // 60)
+    elif secs < 86400:
+        rel = "in %dh%02dm" % (secs // 3600, (secs % 3600) // 60)
+    else:
+        rel = "in %dd%dh" % (secs // 86400, (secs % 86400) // 3600)
+    return "%s (%s)" % (dt.astimezone().strftime("%d/%m %H:%M"), rel)
+
+
+def humanize_iso(iso):
+    if not iso:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return iso
+    return dt.astimezone().strftime("%d/%m %H:%M")
+
+
+def bar(remaining, width=20):
+    r = max(0.0, min(100.0, float(remaining)))
+    fill = int(round(r / 100 * width))
+    color = GRN if r > 40 else (YEL if r > 10 else RED)
+    return "%s%s%s%s" % (color, "█" * fill, RST, "░" * (width - fill))
+
+
+def section(title):
+    line = "═" * max(8, len(title) + 4)
+    print("%s%s %s %s%s" % (BOLD, MAG, title, line[: len(title) + 4], RST))
+
+
+def fmt_tokens(n):
+    if n is None:
+        return "—"
+    n = int(n)
+    if n >= 1_000_000:
+        return "%.2fM" % (n / 1_000_000)
+    if n >= 1_000:
+        return "%.1fK" % (n / 1_000)
+    return str(n)
+
+
+def fmt_cost(usd):
+    if usd is None:
+        return "—"
+    return "$%.2f" % float(usd)
+
+
+# ---- claude-usage embed ----------------------------------------------------
+def load_claude_usage():
+    path = os.path.join(SCRIPT_DIR, "claude-usage")
+    if not os.path.isfile(path):
+        return None
+    # claude-usage has no .py suffix — SourceFileLoader handles that.
+    loader = importlib.machinery.SourceFileLoader("claude_usage", path)
+    spec = importlib.util.spec_from_loader("claude_usage", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def render_claude(cu, include_default=False):
+    section("CLAUDE")
+    discovered = cu.discover_profiles()
+    by_label = {lbl: d for lbl, d in discovered}
+    chosen = list(discovered)
+    default_abs = os.path.abspath(os.path.join(HOME, ".claude"))
+    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    env_is_default = bool(env) and os.path.abspath(os.path.expanduser(env)) == default_abs
+    named_exist = any(d != default_abs for _, d in chosen)
+    if named_exist and not env_is_default and not include_default:
+        chosen = [(l, d) for (l, d) in chosen if d != default_abs]
+    if not chosen:
+        print("   %sno Claude profiles found%s\n" % (RED, RST))
+        return
+    results = [cu.gather(label, cdir) for (label, cdir) in chosen]
+    groups, index = [], {}
+    for r in results:
+        k = cu.group_key(r)
+        if k in index:
+            index[k].append(r)
+        else:
+            index[k] = [r]
+            groups.append(index[k])
+    for members in groups:
+        cu.render_group(members)
+
+
+# ---- cursor ----------------------------------------------------------------
+def read_cursor_token():
+    try:
+        out = subprocess.run(
+            ["security", "find-generic-password", "-s", CURSOR_KEYCHAIN_SERVICE,
+             "-a", CURSOR_KEYCHAIN_ACCOUNT, "-w"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def fetch_cursor_usage(token):
+    req = urllib.request.Request(CURSOR_USAGE_URL, method="GET")
+    req.add_header("Authorization", "Bearer %s" % token)
+    req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", "agent-usage-cli")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        try:
+            return e.code, json.loads(body)
+        except Exception:
+            return e.code, body
+    except Exception as e:
+        return 0, "network error: %s" % e
+
+
+def cursor_agent_about():
+    for cmd in (
+        os.path.join(HOME, ".superset/bin/cursor-agent"),
+        shutil.which("cursor-agent"),
+    ):
+        if not cmd or not os.path.isfile(cmd):
+            continue
+        try:
+            out = subprocess.run(
+                [cmd, "about", "--format", "json"],
+                capture_output=True, text=True, timeout=20,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                return json.loads(out.stdout)
+        except Exception:
+            pass
+    return None
+
+
+def render_cursor():
+    section("CURSOR")
+    about = cursor_agent_about()
+    email = (about or {}).get("userEmail") or ""
+    tier = (about or {}).get("subscriptionTier") or "?"
+    model = (about or {}).get("model") or "?"
+    if email:
+        print("%s%s● Cursor%s  %s(%s · %s)%s" % (BOLD, CYN, RST, DIM, email, model, RST))
+    else:
+        print("%s%s● Cursor%s" % (BOLD, CYN, RST))
+
+    token = read_cursor_token()
+    data, stale_age, reason = None, None, None
+    if token:
+        status, payload = fetch_cursor_usage(token)
+        if status == 200 and isinstance(payload, dict):
+            write_cache("cursor-usage-summary.json", payload)
+            data = payload
+        else:
+            reason = "HTTP %s" % status if status else str(payload)
+            cached, ts = read_cache("cursor-usage-summary.json")
+            if cached is not None:
+                data, stale_age = cached, ts
+    else:
+        reason = "cursor-access-token not in Keychain"
+
+    if about:
+        print("   plan:   %s%s%s  %s(cursor-agent about · subscriptionTier=%s)%s" % (
+            BOLD, tier, RST, DIM, tier, RST))
+    if stale_age is not None:
+        print("   %s⏁ cached %s — live fetch failed (%s)%s" % (YEL, humanize_age(stale_age), reason, RST))
+    elif reason and data is None:
+        print("   %susage unavailable: %s%s" % (RED, reason, RST))
+        print("   %sTODO: quota only visible at cursor.com/settings or Cursor IDE dashboard%s\n" % (DIM, RST))
+        return
+
+    if not isinstance(data, dict):
+        print("   %sno usage data%s\n" % (DIM, RST))
+        return
+
+    membership = data.get("membershipType") or tier
+    cycle_end = data.get("billingCycleEnd")
+    if cycle_end:
+        print("   billing: %s → %s" % (
+            humanize_iso(data.get("billingCycleStart")),
+            humanize_iso(cycle_end),
+        ))
+
+    ind = data.get("individualUsage") or {}
+    plan = ind.get("plan") or {}
+    W = 18
+    if plan.get("limit"):
+        used = float(plan.get("used") or 0)
+        limit = float(plan.get("limit") or 1)
+        remaining = max(0.0, 100.0 * (1.0 - used / limit))
+        print("   %-*s %s %5.1f%% left  %s/%s credits%s" % (
+            W, "included usage",
+            bar(remaining), remaining,
+            int(used), int(limit), RST,
+        ))
+    total_used = plan.get("totalPercentUsed")
+    if isinstance(total_used, (int, float)):
+        remaining = max(0.0, 100.0 - float(total_used))
+        print("   %-*s %s %5.1f%% left%s" % (
+            W, "total usage", bar(remaining), remaining, RST,
+        ))
+    auto_used = plan.get("autoPercentUsed")
+    if isinstance(auto_used, (int, float)):
+        remaining = max(0.0, 100.0 - float(auto_used))
+        print("   %-*s %s %5.1f%% left%s" % (
+            W, "auto model", bar(remaining), remaining, RST,
+        ))
+    api_used = plan.get("apiPercentUsed")
+    if isinstance(api_used, (int, float)):
+        remaining = max(0.0, 100.0 - float(api_used))
+        print("   %-*s %s %5.1f%% left%s" % (
+            W, "API / named", bar(remaining), remaining, RST,
+        ))
+    msg = data.get("autoModelSelectedDisplayMessage")
+    if msg:
+        print("   %s%s%s" % (DIM, msg, RST))
+    print()
+
+
+# ---- codex rate limits from session logs -----------------------------------
+def codex_home():
+    return os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
+
+
+def window_label(minutes):
+    mapping = {300: "5h window", 10080: "7d window", 43200: "30d window"}
+    return mapping.get(int(minutes), "%dm window" % minutes)
+
+
+def latest_codex_rate_limits():
+    """Scan recent Codex session JSONL for the newest token_count.rate_limits."""
+    pattern = os.path.join(codex_home(), "sessions", "**", "*.jsonl")
+    paths = glob.glob(pattern, recursive=True)
+    paths.sort(key=os.path.getmtime, reverse=True)
+    best = None
+    for path in paths[:80]:
+        try:
+            with open(path) as fh:
+                lines = fh.readlines()
+        except Exception:
+            continue
+        for line in reversed(lines[-300:]):
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if obj.get("type") != "event_msg":
+                continue
+            payload = obj.get("payload") or {}
+            if payload.get("type") != "token_count":
+                continue
+            rl = payload.get("rate_limits") or {}
+            primary = rl.get("primary")
+            if not isinstance(primary, dict) or primary.get("used_percent") is None:
+                continue
+            ts = obj.get("timestamp") or ""
+            candidate = (ts, path, rl)
+            if best is None or ts > best[0]:
+                best = candidate
+    if best is None:
+        return None, None, None
+    return best[2], best[1], best[0]
+
+
+def render_codex_limits():
+    rl, source, ts = latest_codex_rate_limits()
+    if not rl:
+        print("   %sno rate_limits in recent Codex session logs%s" % (DIM, RST))
+        print("   %s(run codex once; limits appear in token_count events)%s" % (DIM, RST))
+        return
+    plan = rl.get("plan_type") or "?"
+    print("   plan:   %s%s%s  %s(from session log · plan_type=%s)%s" % (
+        BOLD, str(plan).upper(), RST, DIM, plan, RST))
+    if ts:
+        print("   %sas of %s%s" % (DIM, ts.replace("T", " ").replace("Z", " UTC"), RST))
+    W = 18
+    for label, win in (("primary", rl.get("primary")), ("secondary", rl.get("secondary"))):
+        if not isinstance(win, dict) or win.get("used_percent") is None:
+            continue
+        used = float(win["used_percent"])
+        remaining = max(0.0, 100.0 - used)
+        wl = window_label(win.get("window_minutes") or 0)
+        reset = humanize_reset_epoch(win.get("resets_at"))
+        print("   %-*s %s %5.1f%% left  %s%s%s" % (
+            W, wl, bar(remaining), remaining, DIM, reset, RST,
+        ))
+    if source:
+        print("   %ssource: %s%s" % (DIM, os.path.basename(source), RST))
+
+
+# ---- ccusage integration ---------------------------------------------------
+def run_ccusage_json(args):
+    ccusage = shutil.which("ccusage")
+    if not ccusage:
+        return None, "ccusage not installed (brew install ccusage)"
+    try:
+        out = subprocess.run(
+            [ccusage] + args + ["--json"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except Exception as e:
+        return None, str(e)
+    if out.returncode != 0:
+        err = (out.stderr or out.stdout or "").strip()
+        return None, err or "ccusage exit %s" % out.returncode
+    try:
+        return json.loads(out.stdout), None
+    except Exception as e:
+        return None, "ccusage JSON parse failed: %s" % e
+
+
+def today_iso():
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def month_prefix():
+    return datetime.now().strftime("%Y-%m")
+
+
+def sum_ccusage_days(days, agent_filter=None):
+    today = today_iso()
+    month = month_prefix()
+    today_row = None
+    month_tokens = 0
+    month_cost = 0.0
+    for row in days:
+        period = row.get("period") or row.get("date") or ""
+        agents = (row.get("metadata") or {}).get("agents")
+        if agent_filter:
+            if agents and agent_filter not in agents:
+                continue
+            if not agents and agent_filter not in str(row.get("modelsUsed", "")):
+                # codex-specific schema lacks metadata.agents; accept all codex rows
+                pass
+        tokens = int(row.get("totalTokens") or 0)
+        cost = float(row.get("totalCost") or row.get("costUSD") or 0)
+        if period.startswith(month):
+            month_tokens += tokens
+            month_cost += cost
+        if period == today:
+            today_row = row
+    return today_row, month_tokens, month_cost
+
+
+def render_ccusage_agent(name, cc_args, agent_filter=None):
+    data, err = run_ccusage_json(cc_args)
+    if err:
+        print("   %s%s: %s%s" % (YEL, name, err, RST))
+        return
+    days = data.get("daily") or []
+    if not days:
+        print("   %sno %s logs detected by ccusage%s" % (DIM, name.lower(), RST))
+        return
+    today_row, month_tokens, month_cost = sum_ccusage_days(days, agent_filter)
+    today = today_iso()
+    if today_row:
+        print("   today (%s):  %s tokens  %s" % (
+            today, fmt_tokens(today_row.get("totalTokens")), fmt_cost(
+                today_row.get("totalCost") or today_row.get("costUSD")),
+        ))
+    else:
+        print("   today (%s):  %sno usage yet%s" % (today, DIM, RST))
+    print("   month (%s):  %s tokens  %s" % (month_prefix(), fmt_tokens(month_tokens), fmt_cost(month_cost)))
+
+
+def render_codex():
+    section("CODEX")
+    render_codex_limits()
+    print()
+    render_ccusage_agent("Codex tokens", ["codex", "daily"], agent_filter="codex")
+
+
+def render_opencode():
+    data, err = run_ccusage_json(["opencode", "daily"])
+    if err or not data or not data.get("daily"):
+        return
+    today_row, month_tokens, month_cost = sum_ccusage_days(data.get("daily") or [])
+    if not today_row and month_tokens == 0:
+        return
+    section("OPENCODE")
+    today = today_iso()
+    if today_row:
+        print("   today (%s):  %s tokens  %s" % (
+            today, fmt_tokens(today_row.get("totalTokens")), fmt_cost(
+                today_row.get("totalCost") or today_row.get("costUSD")),
+        ))
+    else:
+        print("   today (%s):  %sno usage yet%s" % (today, DIM, RST))
+    print("   month (%s):  %s tokens  %s" % (
+        month_prefix(), fmt_tokens(month_tokens), fmt_cost(month_cost)))
+
+
+# ---- main ------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(
+        prog="agent-usage",
+        description="Unified agent-tool usage & quota view (Claude, Cursor, Codex, OpenCode).",
+    )
+    ap.add_argument("--include-default", action="store_true",
+                    help="also show bare ~/.claude profile (passed to claude-usage)")
+    ap.add_argument("--watch", type=int, metavar="SECS",
+                    help="refresh every N seconds")
+    ap.add_argument("--selftest", action="store_true",
+                    help="offline checks (no Keychain / no network)")
+    args = ap.parse_args()
+
+    if args.selftest:
+        ok = True
+
+        def check(name, cond):
+            nonlocal ok
+            ok = ok and bool(cond)
+            print("  [%s] %s" % ("OK" if cond else "FAIL", name))
+
+        check("bar full", "█" in bar(100))
+        check("window 5h", window_label(300) == "5h window")
+        check("window 7d", window_label(10080) == "7d window")
+        check("window 30d", window_label(43200) == "30d window")
+        check("claude-usage present", os.path.isfile(os.path.join(SCRIPT_DIR, "claude-usage")))
+        check("load claude-usage", load_claude_usage() is not None)
+        rl, _, _ = latest_codex_rate_limits()
+        check("codex rate_limits parseable", rl is None or isinstance(rl, dict))
+        print("\n%s" % ("ALL OK" if ok else "FAILED"))
+        return 0 if ok else 1
+
+    cu = load_claude_usage()
+    if cu is None:
+        print("%smissing claude-usage alongside this script (%s)%s" % (
+            RED, os.path.join(SCRIPT_DIR, "claude-usage"), RST))
+        return 1
+
+    def run_once():
+        stamp = datetime.now().strftime("%d/%m %H:%M:%S")
+        print("%sagent-usage%s  %s%s%s\n" % (BOLD, RST, DIM, stamp, RST))
+        render_claude(cu, include_default=args.include_default)
+        render_cursor()
+        render_codex()
+        render_opencode()
+
+    if args.watch:
+        try:
+            while True:
+                if sys.stdout.isatty():
+                    sys.stdout.write("\033[2J\033[H")
+                run_once()
+                print("%s↻ every %ss — Ctrl-C to quit%s" % (DIM, args.watch, RST))
+                time.sleep(args.watch)
+        except KeyboardInterrupt:
+            print("\nbye.")
+            return 0
+    else:
+        run_once()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
