@@ -2,7 +2,7 @@
 """
 claude-usage — track your Claude subscription plan & rate-limit usage from the terminal.
 
-Read-only, zero-dependency (Python 3 standard library only). For each Claude Code
+Zero-dependency (Python 3 stdlib only). For each Claude Code
 profile (a CLAUDE_CONFIG_DIR) it:
 
   1. reads the OAuth credential from the macOS Keychain (file fallback elsewhere),
@@ -13,9 +13,8 @@ Design / safety:
   * NEVER prints tokens. While the access token is valid it only READS credentials.
   * When the access token is EXPIRED (that profile hasn't run Claude Code in a
     while) it refreshes it exactly like Claude Code does and writes the rotated
-    credential back to the same Keychain item / file. Anthropic refresh tokens
-    are SINGLE-USE, so saving the rotated token back is required to keep the
-    Claude Code login working. Opt out with --no-refresh (you'll see cached data
+    credential back to the same Keychain item / file (refresh tokens are
+    single-use); if it couldn't be saved, it doesn't refresh. Opt out with --no-refresh (you'll see cached data
     until Claude Code itself refreshes the token).
   * When the live API call fails (e.g. HTTP 429 rate limit), it falls back to the
     last cached response so you keep a view instead of an error.
@@ -270,12 +269,8 @@ def token_expired(oauth, skew_ms=60000):
 
 def refresh_oauth(oauth):
     """Refresh the access token the same way Claude Code does. Mutates `oauth`
-    in place; returns (True, None) or (False, reason).
-
-    Anthropic refresh tokens ROTATE (single-use): the response carries a new
-    refresh_token and the old one is invalidated server-side, so the caller MUST
-    persist the mutated credential (persist_credentials) or the Claude Code
-    login for this profile breaks on its own next refresh."""
+    in place; returns (True, None) or (False, reason). Refresh tokens are
+    single-use: the caller MUST persist the result (persist_credentials)."""
     import urllib.request
     import urllib.error
 
@@ -331,22 +326,22 @@ def parse_keychain_account(find_output):
 
 
 SECURITY_LINE_MAX = 4000  # `security -i` silently truncates lines near 4 KB
+REFRESH_GROWTH_MAX = 1024  # headroom for longer refreshed tokens
 
 
-def keychain_command_line(args):
+def keychain_command_line(args, reserve=0):
     """Quote args as one `security -i` command line, or None if they can't go
     through stdin intact (embedded newline, or too long for its line buffer)."""
     if any(c in a for a in args for c in "\r\n\0"):
         return None
     line = " ".join('"%s"' % a.replace("\\", "\\\\").replace('"', '\\"') for a in args) + "\n"
-    return line if len(line.encode("utf-8")) <= SECURITY_LINE_MAX else None
+    return line if len(line.encode("utf-8")) + reserve <= SECURITY_LINE_MAX else None
 
 
-def persist_credentials(store, oauth):
+def persist_credentials(store, oauth, dry_run=False):
     """Write the refreshed credential back to where it was read from, in Claude
-    Code's own format. Returns (ok, reason). The JSON MUST be minified: the
-    `security` CLI hex-encodes multi-line values, which Claude Code can't read
-    back and would treat as an invalid session."""
+    Code's own format. Returns (ok, reason). The JSON MUST be minified: `security`
+    hex-encodes multi-line values, which Claude Code can't read back. dry_run: check only."""
     if not store:
         return False, "unknown credential source"
     full = store.get("full")
@@ -357,6 +352,8 @@ def persist_credentials(store, oauth):
         full = oauth
     blob = json.dumps(full, separators=(",", ":"))
     if store["kind"] == "file":
+        if dry_run:
+            return True, None
         try:
             tmp = store["path"] + ".tmp"
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -372,12 +369,13 @@ def persist_credentials(store, oauth):
                              capture_output=True, text=True, timeout=30)
         acct = parse_keychain_account(out.stdout) or os.environ.get("USER") or ""
         args = ["add-generic-password", "-U", "-a", acct, "-s", store["service"], "-w", blob]
-        line = keychain_command_line(args)
-        if line is not None:
-            # `security -i` reads the command from stdin, so the value never shows up in argv
-            upd = subprocess.run(["security", "-i"], input=line, capture_output=True, text=True, timeout=30)
-        else:
-            upd = subprocess.run(["security"] + args, capture_output=True, text=True, timeout=30)
+        line = keychain_command_line(args, REFRESH_GROWTH_MAX if dry_run else 0)
+        if line is None:
+            return False, "credential too long for the Keychain"
+        if dry_run:
+            return True, None
+        # stdin keeps the value out of argv
+        upd = subprocess.run(["security", "-i"], input=line, capture_output=True, text=True, timeout=30)
         if upd.returncode != 0:
             err = upd.stderr.strip().replace(blob, "<credential>")
             return False, "keychain update failed: %s" % (err or "exit %d" % upd.returncode)
@@ -932,6 +930,9 @@ def gather(label, config_dir, allow_refresh=True, allow_local=True):
     res["oauth"] = oauth
 
     def do_refresh():
+        ok, why = persist_credentials(store, oauth, dry_run=True)
+        if not ok:
+            return "not refreshed (%s); run Claude Code in this profile" % why
         ok, why = refresh_oauth(oauth)
         if not ok:
             return why

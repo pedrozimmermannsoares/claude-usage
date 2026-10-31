@@ -97,6 +97,25 @@ def run_selftest():
           calls and not any("SELFTEST-TOKEN" in a for cmd, _ in calls for a in cmd))
     check("keychain write sends credential on stdin",
           calls and calls[-1][0] == ["security", "-i"] and "SELFTEST-TOKEN" in calls[-1][1])
+
+    calls.clear()
+    long_oauth = {"accessToken": "SELFTEST-LONG" + "x" * SECURITY_LINE_MAX}
+    real_run, subprocess.run = subprocess.run, fake_run
+    try:
+        saved = persist_credentials({"kind": "keychain", "service": "svc", "full": {}}, long_oauth)
+        can_long = persist_credentials({"kind": "keychain", "service": "svc", "full": {}}, long_oauth, dry_run=True)
+        can_short = persist_credentials({"kind": "keychain", "service": "svc", "full": {}},
+                                        {"accessToken": "SELFTEST-SHORT"}, dry_run=True)
+    finally:
+        subprocess.run = real_run
+    check("long credential not saved", saved[0] is False)
+    check("long credential never goes to argv",
+          not any("SELFTEST-LONG" in a for cmd, _ in calls for a in cmd))
+    check("long credential blocks refresh", can_long[0] is False)
+    check("short credential allows refresh", can_short == (True, None))
+    check("dry run writes nothing", not any(cmd == ["security", "-i"] for cmd, _ in calls))
+    check("file credential allows refresh",
+          persist_credentials({"kind": "file", "path": "/nonexistent/x"}, long_oauth, dry_run=True) == (True, None))
     check("security -i line quoting",
           keychain_command_line(["-a", 'x"y\\z']) == '"-a" "x\\"y\\\\z"\n')
     check("security -i rejects newline / oversize",
