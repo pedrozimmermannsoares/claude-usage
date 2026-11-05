@@ -54,6 +54,10 @@ import sys
 import time
 from datetime import datetime, timezone, timedelta
 
+# Resolve the sibling module for symlink installs and Python's isolated mode.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import usage_http
+
 HOME = os.path.expanduser("~")
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -387,29 +391,7 @@ def persist_credentials(store, oauth, dry_run=False):
 # ---- usage API -------------------------------------------------------------
 def api_get(url, access_token):
     """GET an OAuth endpoint. Return (status_int, json_or_text). Stdlib only."""
-    import urllib.request
-    import urllib.error
-
-    req = urllib.request.Request(url, method="GET")
-    req.add_header("Authorization", "Bearer %s" % access_token)
-    req.add_header("anthropic-beta", BETA_HEADER)
-    req.add_header("Accept", "application/json")
-    req.add_header("User-Agent", "claude-usage-cli")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            body = resp.read().decode()
-            try:
-                return resp.status, json.loads(body)
-            except Exception:
-                return resp.status, body
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")
-        try:
-            return e.code, json.loads(body)
-        except Exception:
-            return e.code, body
-    except Exception as e:
-        return 0, "network error: %s" % e
+    return usage_http.api_get(url, access_token, BETA_HEADER)
 
 
 def fetch_usage(access_token):

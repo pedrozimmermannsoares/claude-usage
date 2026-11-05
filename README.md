@@ -171,6 +171,7 @@ Windows use the `.credentials.json` fallback.
 ```sh
 # copy onto your PATH
 install -m 0755 claude-usage ~/.local/bin/claude-usage
+install -m 0644 usage_http.py ~/.local/bin/usage_http.py
 # or symlink it
 ln -s "$PWD/claude-usage" ~/.local/bin/claude-usage
 ```
@@ -226,6 +227,10 @@ not a balance. So `--billing` simply opens the page where you can read it.
   refresh tokens rotate, *not* saving it back is what would invalidate the login).
   `--no-refresh` removes that path entirely.
 * **Never prints your token.** Only plan, source service name, and usage windows.
+* **Authenticated GET redirects stay on the same origin.** Both `claude-usage`
+  and `agent-usage` retain the Bearer only when scheme, host and effective port
+  stay the same. Other redirects, including HTTPS to HTTP, return the 3xx
+  response without contacting the destination.
 * **Stays local.** The only network call is to Anthropic's usage endpoint, with
   your own token. Any tool that can read this Keychain item is effectively
   authenticated as your Claude Code session — install only tools you trust.

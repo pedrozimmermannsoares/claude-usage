@@ -26,6 +26,10 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
+# Resolve the sibling module for symlink installs and Python's isolated mode.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import usage_http
+
 HOME = os.path.expanduser("~")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CURSOR_USAGE_URL = "https://api2.cursor.sh/auth/usage-summary"
@@ -205,7 +209,7 @@ def fetch_cursor_usage(token):
     req.add_header("Accept", "application/json")
     req.add_header("User-Agent", "agent-usage-cli")
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with usage_http.urlopen_same_origin(req, timeout=20) as resp:
             return resp.status, json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
