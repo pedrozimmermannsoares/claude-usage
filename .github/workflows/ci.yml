@@ -10,7 +10,8 @@ permissions:
 
 jobs:
   selftest:
-    runs-on: ubuntu-latest
+    # PR de fork nunca roda no runner próprio.
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-24.04' || fromJSON(vars.CI_RUNS_ON || '["self-hosted","Linux","ARM64","vmpal"]') }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
