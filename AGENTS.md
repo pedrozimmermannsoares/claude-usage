@@ -1,9 +1,10 @@
 # AGENTS.md — claude-usage
 
-Dois scripts Python sem dependência (stdlib, Python 3.8+), macOS:
+Dois scripts Python sem dependência (stdlib, Python 3.8+), macOS, mais um módulo comum:
 
 - `claude-usage`: mostra plano e janelas de limite (5h/7d) de cada perfil do Claude Code, mais custo local estimado dos logs. Detalhes no `README.md`.
 - `agent-usage`: visão unificada de cota de Claude, Cursor, Codex e OpenCode. Notas de pesquisa no `RELATORIO.md`.
+- `usage_http.py`: cliente HTTP dos dois scripts. Segue redirecionamento só dentro da mesma origem, para o token não ir a outro host. Deve ficar ao lado dos scripts em qualquer cópia instalada.
 
 ## Instalar e rodar
 
@@ -13,7 +14,10 @@ Dois scripts Python sem dependência (stdlib, Python 3.8+), macOS:
 ./claude-usage                 # uso atual
 ./claude-usage --selftest      # checks offline, sem Keychain nem rede
 ./agent-usage --selftest
+python3 -I test_redirects.py   # redirecionamentos HTTP, servidor local
 ```
+
+O CI (`.github/workflows/ci.yml`) roda esses três comandos em push na `main` e em PR.
 
 ## Travas que o código mostra
 
